@@ -70,6 +70,8 @@
 
 API-008/009 保留现有版本对象字段 `storybookId`、`storyVersionId`、`versionNumber`、`title`、`status`、`pages`、`branches`。建议新增 `coverRef`（字符串或 null）。`pages` 项包含 `pageNumber`、`text`、`imageRef`、`defaultNextPageNumber`，后继页为空时为 null。封面或内页缺图时对应字段返回 null，前端显示本地占位图。有素材时返回服务端分配、绑定该版本的资源键，由 API-024 读取。封面导入可按[封面映射](../../data/seed/cover_mapping.json)的 `storybook_id` 找到素材，仓库路径和种子占位值仅用于导入。素材可用性、授权和发布仍按 DCL-002。
 
+数据库的 `story_pages.image_ref` 保持 `TEXT NOT NULL`。API-008/009 校验版本访问权后，按版本和页号解析该字段。仅当引用能解析为该版本中已核验可用的图片时，`imageRef` 才返回受控媒体键。种子中的 `/assets/placeholder.png`、旧版页面的画面描述，以及确认缺少素材的引用，都序列化为 `imageRef=null`。解析依赖暂不可用时返回下表的 503。API-024 仍逐次核验版本和资源访问权，过期或不可访问的资源键按现有规则处理。
+
 ### DCL-006 结束并发与幂等
 
 通过鉴权、资源归属及请求格式校验后，先查会话内的 `clientEventId`。同键同请求重放已保存的原响应数据，同键不同请求（包括修订号不同）返回 409 `IDEMPOTENCY_CONFLICT`。新键遇到 `FINISHED` 时返回已有终态及当前小结，缺少小结时返回 null。新键对 `IN_PROGRESS` 会话首次结束，需在事务内比较 `expectedRevision` 并原子写入终态、递增修订号、事实摘要、小结和重放记录。其他会话状态、或翻页先提交导致修订号不匹配时，返回 409 `SESSION_CONFLICT`，前端读取 API-013 再决定是否以新键提交。若结束先提交，随后的新翻页请求返回 409。成功重复结束和重放均沿用小结生命周期约定。
@@ -86,10 +88,10 @@ JSON 错误统一使用 `{error: {code, message, retryable}, requestId}`。前�
 | 409 | API-001 重复账号 `ACCOUNT_EXISTS`。API-015/019 状态或修订冲突 `SESSION_CONFLICT`，同键不同请求 `IDEMPOTENCY_CONFLICT`，同键执行中 `REQUEST_IN_PROGRESS` | 冲突时先读取会话。执行中按 `Retry-After` 原样重发 |
 | 422 | 字段格式、枚举或必填项不符合约定 `VALIDATION_ERROR` | 提示检查表单或请求字段 |
 | 429 | API-002 登录受限 `RATE_LIMITED` | 按 `Retry-After` 等待后再尝试 |
-| 503 | 依赖暂不可用 `SERVICE_UNAVAILABLE` | 提示稍后重试。读取可重试，写入结果不明时先查询状态 |
+| 503 | 依赖暂不可用 `DEPENDENCY_UNAVAILABLE`，沿用 API-032 的错误码 | 提示稍后重试。读取可重试，已知未提交的写入可由用户重试 |
 | 504 | 写入结果不明 `REQUEST_OUTCOME_UNKNOWN` | 查询会话，保留原请求标识，不自动创建新请求 |
 
-上述场景中 `REQUEST_IN_PROGRESS`、`RATE_LIMITED` 和可重试的 503 读取响应使用 `retryable=true`，其余默认 false。查不到私有资源和资源不属于当前账号使用相同的 404。
+上述场景中 `REQUEST_IN_PROGRESS`、`RATE_LIMITED` 和可重试的 503 读取响应使用 `retryable=true`，其余默认 false。API-032 健康检查继续返回现有的 503 和 `retryable=true`。API-015/019 的写入结果不明时返回 504 `REQUEST_OUTCOME_UNKNOWN`，由前端先查询会话状态。查不到私有资源和资源不属于当前账号使用相同的 404。
 
 ### DCL-008 档案与断线恢复
 

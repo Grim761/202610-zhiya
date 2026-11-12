@@ -181,7 +181,17 @@
         "coverRef": "版本绑定的媒体键或 null",
         "imageRef": "版本绑定的媒体键或 null",
         "placeholder": "缺图时使用客户端本地占位",
-        "access": "API-024 逐次按 common.versionAccess 检查，私有与撤回资源不得越权读取。"
+        "access": "API-024 逐次按 common.versionAccess 检查，私有与撤回资源不得越权读取。",
+        "imageRefConversion": {
+          "storage": "story_pages.image_ref 保持 TEXT NOT NULL。",
+          "resourceKey": "版本和页号解析到已核验可用图片时返回版本绑定的受控媒体键。",
+          "nullCases": [
+            "/assets/placeholder.png",
+            "旧版页面的画面描述",
+            "已确认缺少素材的引用"
+          ],
+          "dependencyFailure": "依赖暂不可用时返回 503 DEPENDENCY_UNAVAILABLE。"
+        }
       },
       "sessionEvent": {
         "clientEventId": {
@@ -198,6 +208,24 @@
           ]
         },
         "terminalReportForChild": null
+      },
+      "dependencyError": {
+        "status": 503,
+        "code": "DEPENDENCY_UNAVAILABLE",
+        "alignedWith": "API-032",
+        "retryable": {
+          "read": true,
+          "write": false
+        },
+        "unknownWriteOutcome": {
+          "status": 504,
+          "code": "REQUEST_OUTCOME_UNKNOWN",
+          "retryable": false,
+          "appliesTo": [
+            "API-015",
+            "API-019"
+          ]
+        }
       }
     },
     "endpoints": [
@@ -221,7 +249,7 @@
         "errorCodes": [
           "ACCOUNT_EXISTS",
           "VALIDATION_ERROR",
-          "SERVICE_UNAVAILABLE"
+          "DEPENDENCY_UNAVAILABLE"
         ]
       },
       {
@@ -246,7 +274,7 @@
           "INVALID_CREDENTIALS",
           "RATE_LIMITED",
           "VALIDATION_ERROR",
-          "SERVICE_UNAVAILABLE"
+          "DEPENDENCY_UNAVAILABLE"
         ]
       },
       {
@@ -260,7 +288,7 @@
           "AUTH_REQUIRED",
           "FORBIDDEN",
           "CSRF_INVALID",
-          "SERVICE_UNAVAILABLE"
+          "DEPENDENCY_UNAVAILABLE"
         ]
       },
       {
@@ -288,7 +316,7 @@
         "errorCodes": [
           "AUTH_REQUIRED",
           "FORBIDDEN",
-          "SERVICE_UNAVAILABLE"
+          "DEPENDENCY_UNAVAILABLE"
         ]
       },
       {
@@ -322,7 +350,7 @@
           "FORBIDDEN",
           "CSRF_INVALID",
           "VALIDATION_ERROR",
-          "SERVICE_UNAVAILABLE"
+          "DEPENDENCY_UNAVAILABLE"
         ]
       },
       {
@@ -355,7 +383,7 @@
           "CSRF_INVALID",
           "RESOURCE_NOT_FOUND",
           "VALIDATION_ERROR",
-          "SERVICE_UNAVAILABLE"
+          "DEPENDENCY_UNAVAILABLE"
         ]
       },
       {
@@ -375,7 +403,7 @@
           "CSRF_INVALID",
           "RESOURCE_NOT_FOUND",
           "VALIDATION_ERROR",
-          "SERVICE_UNAVAILABLE"
+          "DEPENDENCY_UNAVAILABLE"
         ]
       },
       {
@@ -438,7 +466,7 @@
           "AUTH_REQUIRED",
           "FORBIDDEN",
           "VALIDATION_ERROR",
-          "SERVICE_UNAVAILABLE"
+          "DEPENDENCY_UNAVAILABLE"
         ]
       },
       {
@@ -494,7 +522,7 @@
           "FORBIDDEN",
           "RESOURCE_NOT_FOUND",
           "VALIDATION_ERROR",
-          "SERVICE_UNAVAILABLE"
+          "DEPENDENCY_UNAVAILABLE"
         ]
       },
       {
@@ -528,7 +556,7 @@
           "CSRF_INVALID",
           "RESOURCE_NOT_FOUND",
           "VALIDATION_ERROR",
-          "SERVICE_UNAVAILABLE"
+          "DEPENDENCY_UNAVAILABLE"
         ]
       },
       {
@@ -568,7 +596,7 @@
           "AUTH_REQUIRED",
           "FORBIDDEN",
           "VALIDATION_ERROR",
-          "SERVICE_UNAVAILABLE"
+          "DEPENDENCY_UNAVAILABLE"
         ]
       },
       {
@@ -617,7 +645,7 @@
           "FORBIDDEN",
           "RESOURCE_NOT_FOUND",
           "VALIDATION_ERROR",
-          "SERVICE_UNAVAILABLE"
+          "DEPENDENCY_UNAVAILABLE"
         ]
       },
       {
@@ -652,7 +680,7 @@
           "IDEMPOTENCY_CONFLICT",
           "REQUEST_IN_PROGRESS",
           "VALIDATION_ERROR",
-          "SERVICE_UNAVAILABLE",
+          "DEPENDENCY_UNAVAILABLE",
           "REQUEST_OUTCOME_UNKNOWN"
         ]
       },
@@ -704,7 +732,7 @@
           "IDEMPOTENCY_CONFLICT",
           "REQUEST_IN_PROGRESS",
           "VALIDATION_ERROR",
-          "SERVICE_UNAVAILABLE",
+          "DEPENDENCY_UNAVAILABLE",
           "REQUEST_OUTCOME_UNKNOWN"
         ]
       },
@@ -725,7 +753,7 @@
           "FORBIDDEN",
           "RESOURCE_NOT_FOUND",
           "VALIDATION_ERROR",
-          "SERVICE_UNAVAILABLE"
+          "DEPENDENCY_UNAVAILABLE"
         ]
       }
     ],
