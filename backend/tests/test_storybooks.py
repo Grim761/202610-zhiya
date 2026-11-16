@@ -171,5 +171,12 @@ def test_reading_event_transitions_and_idempotency(bookshelf):
     assert data["session"]["visitedPageNumbers"] == [1, 2]
     assert data["session"]["revision"] == 2 and len(data["events"]) == 2
     with closing(sqlite3.connect(path)) as db, db:
+        db.execute("""INSERT INTO request_executions
+            (owner_account_id, session_id, scope_type, scope_id, client_request_id, request_digest,
+             status, execution_token, started_at, deadline_at) VALUES (1, ?, 'SESSION_EVENT', ?,
+             'other-endpoint', 'different-digest', 'RUNNING', 'token', 1, 100)""", (session, session))
+    collision = first.post(url, headers=headers, json={**change, "clientEventId": "other-endpoint"})
+    assert collision.status_code == 409 and collision.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    with closing(sqlite3.connect(path)) as db, db:
         db.execute("UPDATE story_versions SET status = 'WITHDRAWN' WHERE id = 11")
     assert first.post(url, headers=headers, json=started).status_code == 404

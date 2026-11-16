@@ -153,7 +153,9 @@ def get_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
 
 @router.post("/{session_id}/events", status_code=201)
 def add_reading_event(payload: ReadingEvent, request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
-    digest = hashlib.sha256(payload.model_dump_json().encode("utf-8")).hexdigest()
+    canonical = json.dumps({"method": "POST", "path": f"/api/v1/reading-sessions/{session_id}/events",
+                            "body": payload.model_dump()}, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     try:
         with closing(connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
@@ -170,12 +172,19 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
             ).fetchone()
             if not row:
                 return error(404, "RESOURCE_NOT_FOUND", "会话不可用")
-            previous = db.execute("SELECT request_digest, response_json FROM interaction_events WHERE session_id = ? AND request_key = ?",
+            previous = db.execute("""SELECT request_digest, status, response_status, response_body
+                                  FROM request_executions WHERE scope_type = 'SESSION_EVENT'
+                                  AND scope_id = ? AND client_request_id = ?""",
                                   (session_id, payload.clientEventId)).fetchone()
             if previous:
                 if previous["request_digest"] != digest:
                     return error(409, "IDEMPOTENCY_CONFLICT", "请求标识已用于其他操作")
-                return JSONResponse(status_code=200, content=json.loads(previous["response_json"]))
+                if previous["status"] == "RUNNING":
+                    return error(409, "REQUEST_IN_PROGRESS", "请求正在处理", retryable=True, headers={"Retry-After": "1"})
+                if previous["status"] == "UNKNOWN":
+                    return error(504, "REQUEST_OUTCOME_UNKNOWN", "请求结果未知，请先查询会话")
+                return JSONResponse(status_code=200 if previous["status"] == "SUCCEEDED" else previous["response_status"],
+                                    content=json.loads(previous["response_body"]))
             if row["revision"] != payload.expectedRevision:
                 return error(409, "SESSION_CONFLICT", "会话状态已变化")
             if payload.eventType == "STARTED":
@@ -201,6 +210,12 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
             response = {"data": {"interactionEventId": cursor.lastrowid, "revision": revision}, "requestId": str(uuid4())}
             db.execute("UPDATE interaction_events SET response_json = ? WHERE id = ?",
                        (json.dumps(response, ensure_ascii=False), cursor.lastrowid))
+            db.execute("""INSERT INTO request_executions
+                (owner_account_id, session_id, scope_type, scope_id, client_request_id, request_digest,
+                 status, execution_token, started_at, deadline_at, completed_at, response_status, response_body)
+                VALUES (?, ?, 'SESSION_EVENT', ?, ?, ?, 'SUCCEEDED', ?, ?, ?, ?, 201, ?)""",
+                (owner, session_id, session_id, payload.clientEventId, digest, str(uuid4()), now, now + 25000,
+                 now, json.dumps(response, ensure_ascii=False)))
             return JSONResponse(status_code=201, content=response)
     except sqlite3.Error:
         return error(503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
