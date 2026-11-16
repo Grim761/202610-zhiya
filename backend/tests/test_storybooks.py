@@ -5,6 +5,7 @@ import hashlib
 import json
 import time
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -214,3 +215,23 @@ def test_running_request_expires_to_unknown_without_reexecution(bookshelf):
     with closing(sqlite3.connect(path)) as db:
         assert db.execute("SELECT status FROM request_executions WHERE client_request_id = 'running'").fetchone()[0] == "UNKNOWN"
         assert db.execute("SELECT COUNT(*) FROM interaction_events WHERE session_id = ?", (session,)).fetchone()[0] == 0
+
+
+def test_concurrent_event_retries_commit_once(bookshelf):
+    first, _, path = bookshelf
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    profile = first.post("/api/v1/child-profiles", headers=headers,
+                         json={"ageBand": "AGE_3_4", "preferredMinutes": 10}).json()["data"]
+    session = first.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile["childProfileId"], "storyVersionId": 11, "mode": "PARENT_CHILD"
+    }).json()["data"]["readingSessionId"]
+    url = f"/api/v1/reading-sessions/{session}/events"
+    body = {"eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "same-key"}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: first.post(url, headers=headers, json=body), range(2)))
+    assert sorted(response.status_code for response in responses) == [200, 201]
+    assert responses[0].json() == responses[1].json()
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT COUNT(*) FROM interaction_events WHERE session_id = ?", (session,)).fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM request_executions WHERE session_id = ?", (session,)).fetchone()[0] == 1
+        assert db.execute("SELECT revision FROM reading_sessions WHERE id = ?", (session,)).fetchone()[0] == 1
