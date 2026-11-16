@@ -172,7 +172,7 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
             ).fetchone()
             if not row:
                 return error(404, "RESOURCE_NOT_FOUND", "会话不可用")
-            previous = db.execute("""SELECT request_digest, status, response_status, response_body
+            previous = db.execute("""SELECT request_digest, status, response_status, response_body, deadline_at
                                   FROM request_executions WHERE scope_type = 'SESSION_EVENT'
                                   AND scope_id = ? AND client_request_id = ?""",
                                   (session_id, payload.clientEventId)).fetchone()
@@ -180,6 +180,15 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
                 if previous["request_digest"] != digest:
                     return error(409, "IDEMPOTENCY_CONFLICT", "请求标识已用于其他操作")
                 if previous["status"] == "RUNNING":
+                    now = int(time.time() * 1000)
+                    if previous["deadline_at"] <= now:
+                        failure = error(504, "REQUEST_OUTCOME_UNKNOWN", "请求结果未知，请先查询会话")
+                        db.execute("""UPDATE request_executions SET status = 'UNKNOWN', completed_at = ?,
+                                      response_status = 504, response_body = ? WHERE scope_type = 'SESSION_EVENT'
+                                      AND scope_id = ? AND client_request_id = ? AND status = 'RUNNING'
+                                      AND deadline_at <= ?""",
+                                   (now, failure.body.decode('utf-8'), session_id, payload.clientEventId, now))
+                        return failure
                     return error(409, "REQUEST_IN_PROGRESS", "请求正在处理", retryable=True, headers={"Retry-After": "1"})
                 if previous["status"] == "UNKNOWN":
                     return error(504, "REQUEST_OUTCOME_UNKNOWN", "请求结果未知，请先查询会话")

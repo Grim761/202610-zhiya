@@ -1,6 +1,9 @@
 """Permission, filtering and serialization checks for the guardian bookshelf."""
 
 import sqlite3
+import hashlib
+import json
+import time
 from contextlib import closing
 from pathlib import Path
 
@@ -180,3 +183,34 @@ def test_reading_event_transitions_and_idempotency(bookshelf):
     with closing(sqlite3.connect(path)) as db, db:
         db.execute("UPDATE story_versions SET status = 'WITHDRAWN' WHERE id = 11")
     assert first.post(url, headers=headers, json=started).status_code == 404
+
+
+def test_running_request_expires_to_unknown_without_reexecution(bookshelf):
+    first, _, path = bookshelf
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    profile = first.post("/api/v1/child-profiles", headers=headers,
+                         json={"ageBand": "AGE_3_4", "preferredMinutes": 10}).json()["data"]
+    session = first.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile["childProfileId"], "storyVersionId": 11, "mode": "PARENT_CHILD"
+    }).json()["data"]["readingSessionId"]
+    url = f"/api/v1/reading-sessions/{session}/events"
+    body = {"eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "running"}
+    canonical = json.dumps({"method": "POST", "path": url, "body": body}, sort_keys=True,
+                           separators=(',', ':'), ensure_ascii=False)
+    digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    now = int(time.time() * 1000)
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("""INSERT INTO request_executions
+            (owner_account_id, session_id, scope_type, scope_id, client_request_id, request_digest,
+             status, execution_token, started_at, deadline_at) VALUES (1, ?, 'SESSION_EVENT', ?,
+             'running', ?, 'RUNNING', 'token', ?, ?)""", (session, session, digest, now, now + 60000))
+    response = first.post(url, headers=headers, json=body)
+    assert response.status_code == 409 and response.json()["error"]["code"] == "REQUEST_IN_PROGRESS"
+    assert response.headers["Retry-After"] == "1"
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("UPDATE request_executions SET started_at = 1, deadline_at = 2 WHERE client_request_id = 'running'")
+    assert first.post(url, headers=headers, json=body).json()["error"]["code"] == "REQUEST_OUTCOME_UNKNOWN"
+    assert first.post(url, headers=headers, json=body).status_code == 504
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT status FROM request_executions WHERE client_request_id = 'running'").fetchone()[0] == "UNKNOWN"
+        assert db.execute("SELECT COUNT(*) FROM interaction_events WHERE session_id = ?", (session,)).fetchone()[0] == 0
