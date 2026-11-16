@@ -1,6 +1,7 @@
 """Guardian reading sessions: normal creation and recovery (no continuation switching)."""
 
 import json
+import hashlib
 import sqlite3
 import time
 from contextlib import closing
@@ -9,6 +10,7 @@ from typing import Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Path, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.v1.auth import connect, error
@@ -24,6 +26,14 @@ class SessionCreate(BaseModel):
     childProfileId: int = Field(ge=1, le=MAX_ID, strict=True)
     storyVersionId: int = Field(ge=1, le=MAX_ID, strict=True)
     mode: Literal["PARENT_CHILD"]
+
+
+class ReadingEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    eventType: Literal["STARTED", "PAGE_CHANGED"]
+    pageNumber: int = Field(ge=1, le=MAX_ID, strict=True)
+    expectedRevision: int = Field(ge=0, le=MAX_ID, strict=True)
+    clientEventId: str = Field(min_length=1, max_length=64)
 
 
 def session_object(row):
@@ -139,3 +149,58 @@ def get_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
                              "report": report_data}, "requestId": str(uuid4())}
     except sqlite3.Error:
         return error(503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
+
+
+@router.post("/{session_id}/events", status_code=201)
+def add_reading_event(payload: ReadingEvent, request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
+    digest = hashlib.sha256(payload.model_dump_json().encode("utf-8")).hexdigest()
+    try:
+        with closing(connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            owner, failure = guardian(db, request, write=True)
+            if failure:
+                return failure
+            row = db.execute(
+                """SELECT s.* FROM reading_sessions s
+                JOIN child_profiles p ON p.id = s.profile_id
+                JOIN story_versions v ON v.id = s.version_id
+                JOIN storybooks b ON b.id = v.storybook_id
+                WHERE s.id = ? AND p.guardian_id = ? AND """ + SESSION_ACCESS,
+                (session_id, owner, owner, owner),
+            ).fetchone()
+            if not row:
+                return error(404, "RESOURCE_NOT_FOUND", "会话不可用")
+            previous = db.execute("SELECT request_digest, response_json FROM interaction_events WHERE session_id = ? AND request_key = ?",
+                                  (session_id, payload.clientEventId)).fetchone()
+            if previous:
+                if previous["request_digest"] != digest:
+                    return error(409, "IDEMPOTENCY_CONFLICT", "请求标识已用于其他操作")
+                return JSONResponse(status_code=200, content=json.loads(previous["response_json"]))
+            if row["revision"] != payload.expectedRevision:
+                return error(409, "SESSION_CONFLICT", "会话状态已变化")
+            if payload.eventType == "STARTED":
+                valid = row["status"] == "CREATED" and payload.pageNumber == row["start_page_number"]
+            else:
+                page = db.execute("SELECT default_next_page_number FROM story_pages WHERE version_id = ? AND page_no = ?",
+                                  (row["version_id"], row["current_page_no"])).fetchone()
+                valid = row["status"] == "IN_PROGRESS" and page and page[0] == payload.pageNumber
+            if not valid:
+                return error(409, "SESSION_CONFLICT", "当前状态或页面不允许此操作")
+            now = int(time.time() * 1000)
+            revision = row["revision"] + 1
+            visited = json.loads(row["visited_pages_json"])
+            visited.append(payload.pageNumber)
+            db.execute("""UPDATE reading_sessions SET status = 'IN_PROGRESS', current_page_no = ?,
+                       started_at = COALESCE(started_at, ?), revision = ?, visited_pages_json = ? WHERE id = ?""",
+                       (payload.pageNumber, now, revision, json.dumps(visited), session_id))
+            cursor = db.execute("""INSERT INTO interaction_events
+                (session_id, version_id, request_key, request_digest, response_json, page_no, event_type,
+                 result_status, revision_after, created_at) VALUES (?, ?, ?, ?, '{}', ?, ?, 'SUCCESS', ?, ?)""",
+                (session_id, row["version_id"], payload.clientEventId, digest, payload.pageNumber,
+                 payload.eventType, revision, now))
+            response = {"data": {"interactionEventId": cursor.lastrowid, "revision": revision}, "requestId": str(uuid4())}
+            db.execute("UPDATE interaction_events SET response_json = ? WHERE id = ?",
+                       (json.dumps(response, ensure_ascii=False), cursor.lastrowid))
+            return JSONResponse(status_code=201, content=response)
+    except sqlite3.Error:
+        return error(503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")

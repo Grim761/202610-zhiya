@@ -140,3 +140,36 @@ def test_reading_session_history_and_report_projection(bookshelf):
     with closing(sqlite3.connect(path)) as db, db:
         db.execute("UPDATE reading_reports SET status = 'READY' WHERE session_id = ?", (session_id,))
     assert first.get(f"/api/v1/reading-sessions/{session_id}").json()["data"]["report"]["activities"] == [{"name": "hidden"}]
+
+
+def test_reading_event_transitions_and_idempotency(bookshelf):
+    first, second, path = bookshelf
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    other = {"X-CSRF-Token": second.cookies["zhiya_csrf"]}
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("INSERT INTO story_pages (version_id, page_no, body_text, image_ref) VALUES (11, 2, 'second', 'none')")
+        db.execute("UPDATE story_pages SET default_next_page_number = 2 WHERE version_id = 11 AND page_no = 1")
+    profile = first.post("/api/v1/child-profiles", headers=headers,
+                         json={"ageBand": "AGE_3_4", "preferredMinutes": 10}).json()["data"]
+    session = first.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile["childProfileId"], "storyVersionId": 11, "mode": "PARENT_CHILD"
+    }).json()["data"]["readingSessionId"]
+    url = f"/api/v1/reading-sessions/{session}/events"
+    started = {"eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start"}
+    assert second.post(url, headers=other, json=started).status_code == 404
+    assert first.post(url, json=started).status_code == 403
+    initial = first.post(url, headers=headers, json=started)
+    assert initial.status_code == 201 and initial.json()["data"]["revision"] == 1
+    replay = first.post(url, headers=headers, json=started)
+    assert replay.status_code == 200 and replay.json() == initial.json()
+    assert first.post(url, headers=headers, json={**started, "pageNumber": 2}).json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    change = {"eventType": "PAGE_CHANGED", "pageNumber": 2, "expectedRevision": 1, "clientEventId": "page"}
+    assert first.post(url, headers=headers, json={**change, "pageNumber": 5}).status_code == 409
+    assert first.post(url, headers=headers, json=change).status_code == 201
+    assert first.post(url, headers=headers, json={**change, "clientEventId": "stale"}).status_code == 409
+    data = first.get(f"/api/v1/reading-sessions/{session}").json()["data"]
+    assert data["session"]["visitedPageNumbers"] == [1, 2]
+    assert data["session"]["revision"] == 2 and len(data["events"]) == 2
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("UPDATE story_versions SET status = 'WITHDRAWN' WHERE id = 11")
+    assert first.post(url, headers=headers, json=started).status_code == 404
