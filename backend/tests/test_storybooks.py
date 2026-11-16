@@ -89,3 +89,54 @@ def test_authentication_and_dependency_failure(bookshelf, monkeypatch, tmp_path)
     monkeypatch.setenv("ZHIYA_DB_PATH", str(tmp_path / "missing.sqlite3"))
     response = first.get("/api/v1/storybooks")
     assert response.status_code == 503 and response.json()["error"]["retryable"] is True
+
+
+def test_reading_session_create_recovery_and_isolation(bookshelf):
+    first, second, path = bookshelf
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    other_headers = {"X-CSRF-Token": second.cookies["zhiya_csrf"]}
+    profile = first.post("/api/v1/child-profiles", headers=headers,
+                         json={"ageBand": "AGE_3_4", "preferredMinutes": 10}).json()["data"]
+    body = {"childProfileId": profile["childProfileId"], "storyVersionId": 11, "mode": "PARENT_CHILD"}
+    assert first.post("/api/v1/reading-sessions", json=body).status_code == 403
+    assert second.post("/api/v1/reading-sessions", headers=other_headers, json=body).status_code == 404
+    assert first.post("/api/v1/reading-sessions", headers=headers,
+                      json={**body, "storyVersionId": 31}).status_code == 404
+    assert first.post("/api/v1/reading-sessions", headers=headers,
+                      json={**body, "storyVersionId": 41}).status_code == 404
+    # Continuation switching is deliberately not accepted by the ordinary create path.
+    assert first.post("/api/v1/reading-sessions", headers=headers,
+                      json={**body, "sourceReadingSessionId": 1}).status_code == 422
+    response = first.post("/api/v1/reading-sessions", headers=headers, json=body)
+    assert response.status_code == 201
+    session = response.json()["data"]
+    session_id = session["readingSessionId"]
+    assert (session["currentPage"], session["visitedPageNumbers"], session["status"], session["revision"]) == (1, [], "CREATED", 0)
+    assert first.get(f"/api/v1/reading-sessions/{session_id}").json()["data"] == {
+        "session": session, "events": [], "report": None}
+    assert second.get(f"/api/v1/reading-sessions/{session_id}").status_code == 404
+    assert second.get("/api/v1/reading-sessions").json()["data"]["items"] == []
+    assert first.get("/api/v1/reading-sessions").json()["data"]["items"] == [session]
+    assert first.get("/api/v1/reading-sessions", params={"pageSize": 51}).status_code == 422
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("UPDATE story_versions SET status = 'WITHDRAWN' WHERE id = 11")
+    assert first.get(f"/api/v1/reading-sessions/{session_id}").status_code == 404
+    assert first.get("/api/v1/reading-sessions").json()["data"]["items"] == []
+
+
+def test_reading_session_history_and_report_projection(bookshelf):
+    first, _, path = bookshelf
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    profile = first.post("/api/v1/child-profiles", headers=headers,
+                         json={"ageBand": "AGE_5_6", "preferredMinutes": 10}).json()["data"]
+    body = {"childProfileId": profile["childProfileId"], "storyVersionId": 21, "mode": "PARENT_CHILD"}
+    result = first.post("/api/v1/reading-sessions", headers=headers, json=body)
+    assert result.status_code == 201  # reviewed, owned private history
+    session_id = result.json()["data"]["readingSessionId"]
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("INSERT INTO reading_reports VALUES (?, 'PENDING', '事实摘要', '[{\"name\":\"hidden\"}]', 1)", (session_id,))
+    report = first.get(f"/api/v1/reading-sessions/{session_id}").json()["data"]["report"]
+    assert report == {"readingSessionId": session_id, "status": "PENDING", "summary": "事实摘要", "activities": []}
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("UPDATE reading_reports SET status = 'READY' WHERE session_id = ?", (session_id,))
+    assert first.get(f"/api/v1/reading-sessions/{session_id}").json()["data"]["report"]["activities"] == [{"name": "hidden"}]
