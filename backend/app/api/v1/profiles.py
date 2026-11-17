@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from app.api.v1.auth import Principal, authenticate_request, connect, error
 from app.services.cleanup import delete_session_rows, purge_voice_media
+from app.services.reading_reports import settle_expired_grants
 
 router = APIRouter(prefix="/api/v1/child-profiles")
 AgeBand = Literal["AGE_3_4", "AGE_4_5", "AGE_5_6"]
@@ -66,8 +67,8 @@ class ProfileUpdate(ProfileFields):
         return self
 
 
-def guardian_session(db, request: Request, *, write: bool) -> tuple[Principal | None, object]:
-    principal, failure = authenticate_request(db, request, write=write)
+def guardian_session(db, request: Request, *, write: bool, in_write_tx: bool = False) -> tuple[Principal | None, object]:
+    principal, failure = authenticate_request(db, request, write=write, in_write_tx=in_write_tx)
     if failure:
         return None, failure
     if principal.role != "GUARDIAN":
@@ -75,8 +76,8 @@ def guardian_session(db, request: Request, *, write: bool) -> tuple[Principal | 
     return principal, None
 
 
-def guardian(db, request: Request, *, write: bool):
-    principal, failure = guardian_session(db, request, write=write)
+def guardian(db, request: Request, *, write: bool, in_write_tx: bool = False):
+    principal, failure = guardian_session(db, request, write=write, in_write_tx=in_write_tx)
     if failure:
         return None, failure
     return principal.guardian_id, None
@@ -92,6 +93,7 @@ def serialize(row):
 @router.get("")
 def list_profiles(request: Request):
     try:
+        settle_expired_grants(request)
         with closing(connect()) as db:
             owner, failure = guardian(db, request, write=False)
             if failure:
@@ -107,7 +109,7 @@ def create_profile(payload: ProfileCreate, request: Request):
     try:
         with closing(connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            owner, failure = guardian(db, request, write=True)
+            owner, failure = guardian(db, request, write=True, in_write_tx=True)
             if failure:
                 return failure
             now = int(time.time() * 1000)
@@ -130,7 +132,7 @@ def update_profile(payload: ProfileUpdate, request: Request,
     try:
         with closing(connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            owner, failure = guardian(db, request, write=True)
+            owner, failure = guardian(db, request, write=True, in_write_tx=True)
             if failure:
                 return failure
             row = db.execute(
@@ -160,7 +162,7 @@ def delete_profile(request: Request, profile_id: int = Path(ge=1, le=90071992547
     try:
         with closing(connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            owner, failure = guardian(db, request, write=True)
+            owner, failure = guardian(db, request, write=True, in_write_tx=True)
             if failure:
                 return failure
             row = db.execute(

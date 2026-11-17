@@ -16,7 +16,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.core.config import database_path
+from app.db.connection import connect
+from app.services.reading_reports import queue_deferred_reports, settle_expired_grants_in_tx
 
 router = APIRouter(prefix="/api/v1/auth")
 SESSION_COOKIE = "zhiya_session"
@@ -46,13 +47,6 @@ def error(request: Request, status: int, code: str, message: str, *, retryable: 
                  "requestId": request.state.request_id},
         headers=headers,
     )
-
-
-def connect(timeout: float = 5.0):
-    db = sqlite3.connect(f"{database_path().as_uri()}?mode=rw", uri=True, timeout=timeout)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys = ON")
-    return db
 
 
 def token_digest(token: str) -> str:
@@ -105,8 +99,15 @@ def set_session_cookies(response: Response, token: str, max_age: int) -> None:
                         httponly=False, samesite="lax", path="/")
 
 
-def authenticate_request(db, request: Request, *, write: bool, allow_expired_child: bool = False):
-    """Authenticate either a live guardian auth_session or an active child_grant."""
+def authenticate_request(
+    db,
+    request: Request,
+    *,
+    write: bool,
+    allow_expired_child: bool = False,
+    in_write_tx: bool = False,
+):
+    """Authenticate either a live guardian auth_session or a child_grant."""
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
         return None, error(request, 401, "AUTH_REQUIRED", "请先登录")
@@ -125,20 +126,24 @@ def authenticate_request(db, request: Request, *, write: bool, allow_expired_chi
             return None, error(request, 403, "CSRF_INVALID", "请求校验失败")
         return Principal(guardian_id=guardian_row["account_id"], role="GUARDIAN",
                          auth_session_id=guardian_row["session_id"]), None
-    expiry_clause = "" if allow_expired_child else " AND g.expires_at > ?"
-    params = (digest, now) if allow_expired_child else (digest, now, now)
     child_row = db.execute(
-        f"""SELECT g.id AS grant_id, g.profile_id, g.expires_at, p.guardian_id
-            FROM child_grants g
-            JOIN child_profiles p ON p.id = g.profile_id
-            JOIN accounts a ON a.id = p.guardian_id
-            WHERE g.token_digest = ? AND g.revoked_at IS NULL AND g.issued_at <= ?
-              AND a.role = 'GUARDIAN'{expiry_clause}""",
-        params,
+        """SELECT g.id AS grant_id, g.profile_id, g.expires_at, p.guardian_id
+           FROM child_grants g
+           JOIN child_profiles p ON p.id = g.profile_id
+           JOIN accounts a ON a.id = p.guardian_id
+           WHERE g.token_digest = ? AND g.revoked_at IS NULL AND g.issued_at <= ?
+             AND a.role = 'GUARDIAN'""",
+        (digest, now),
     ).fetchone()
     if child_row:
         if write and not valid_csrf(request, token):
             return None, error(request, 403, "CSRF_INVALID", "请求校验失败")
+        if child_row["expires_at"] <= now:
+            if in_write_tx:
+                pending = settle_expired_grants_in_tx(db, now=now, grant_id=child_row["grant_id"])
+                queue_deferred_reports(request, pending)
+            if not allow_expired_child:
+                return None, error(request, 401, "AUTH_REQUIRED", "请先登录")
         return Principal(guardian_id=child_row["guardian_id"], role="CHILD",
                          grant_id=child_row["grant_id"], profile_id=child_row["profile_id"],
                          grant_expires_at=child_row["expires_at"]), None
@@ -224,15 +229,18 @@ def logout(request: Request):
     try:
         with closing(connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            principal, failure = authenticate_request(db, request, write=True, allow_expired_child=True)
+            principal, failure = authenticate_request(db, request, write=True, allow_expired_child=True, in_write_tx=True)
             if failure:
                 return failure
             if principal.role == "GUARDIAN":
+                queue_deferred_reports(request, settle_expired_grants_in_tx(db, now=now, guardian_id=principal.guardian_id))
                 db.execute("UPDATE auth_sessions SET revoked_at = ? WHERE id = ?",
                            (now, principal.auth_session_id))
                 grant_ids = [r[0] for r in db.execute(
-                    "SELECT id FROM child_grants WHERE issued_by_session_id = ? AND revoked_at IS NULL",
-                    (principal.auth_session_id,),
+                    """SELECT g.id FROM child_grants g
+                       JOIN child_profiles p ON p.id = g.profile_id
+                       WHERE p.guardian_id = ? AND g.revoked_at IS NULL""",
+                    (principal.guardian_id,),
                 )]
                 for gid in grant_ids:
                     revoke_grant_and_interrupt(db, gid, now)
@@ -254,7 +262,7 @@ def parent_unlock(payload: Credentials, request: Request):
     try:
         with closing(connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            principal, failure = authenticate_request(db, request, write=True, allow_expired_child=True)
+            principal, failure = authenticate_request(db, request, write=True, allow_expired_child=True, in_write_tx=True)
             if failure:
                 return failure
             if principal.role != "CHILD":

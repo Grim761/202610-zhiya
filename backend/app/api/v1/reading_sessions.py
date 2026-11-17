@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.v1.auth import (
     Principal,
+    SESSION_SECONDS,
     authenticate_request,
     connect,
     error,
@@ -25,7 +26,15 @@ from app.api.v1.auth import (
 from app.api.v1.profiles import guardian, guardian_session
 from app.api.v1.storybooks import VISIBLE
 from app.services.cleanup import delete_session_rows, purge_voice_media
-from app.services.reading_reports import ensure_startup_recovered, fact_summary, generate_report, report_object
+from app.services.reading_reports import (
+    ensure_startup_recovered,
+    fact_summary,
+    generate_report,
+    queue_deferred_reports,
+    report_object,
+    settle_expired_grants,
+    settle_expired_grants_in_tx,
+)
 
 router = APIRouter(prefix="/api/v1/reading-sessions")
 MAX_ID = 9007199254740991
@@ -85,7 +94,7 @@ def create_session(payload: SessionCreate, request: Request):
     try:
         with closing(connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            owner, failure = guardian(db, request, write=True)
+            owner, failure = guardian(db, request, write=True, in_write_tx=True)
             if failure:
                 return failure
             profile = db.execute("SELECT 1 FROM child_profiles WHERE id = ? AND guardian_id = ?",
@@ -115,6 +124,7 @@ def create_session(payload: SessionCreate, request: Request):
 def list_sessions(request: Request, page: int = Query(default=1, ge=1, le=MAX_ID),
                   pageSize: int = Query(default=20, ge=1, le=50)):
     try:
+        settle_expired_grants(request)
         with closing(connect()) as db:
             db.execute("BEGIN")
             owner, failure = guardian(db, request, write=False)
@@ -140,6 +150,7 @@ def list_sessions(request: Request, page: int = Query(default=1, ge=1, le=MAX_ID
 @router.get("/{session_id}")
 def get_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
     try:
+        settle_expired_grants(request)
         with closing(connect()) as db:
             db.execute("BEGIN")
             principal, failure = authenticate_request(db, request, write=False)
@@ -172,10 +183,12 @@ def update_mode_settings(payload: ModeSettings, request: Request, session_id: in
     try:
         with closing(connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            principal, failure = guardian_session(db, request, write=True)
+            principal, failure = guardian_session(db, request, write=True, in_write_tx=True)
             if failure:
                 return failure
             owner = principal.guardian_id
+            now = int(time.time() * 1000)
+            queue_deferred_reports(request, settle_expired_grants_in_tx(db, now=now, guardian_id=owner))
             row = db.execute(
                 """SELECT s.* FROM reading_sessions s
                 JOIN child_profiles p ON p.id = s.profile_id
@@ -186,17 +199,16 @@ def update_mode_settings(payload: ModeSettings, request: Request, session_id: in
                 return error(request, 404, "RESOURCE_NOT_FOUND", "会话不可用")
             if row["version_id"] not in unique_ids:
                 return error(request, 422, "VALIDATION_ERROR", "授权版本范围须包含当前会话绘本")
-            placeholders = ",".join("?" * len(unique_ids))
-            grantable = db.execute(
-                f"""SELECT v.id FROM story_versions v JOIN storybooks b ON b.id = v.storybook_id
-                    WHERE v.id IN ({placeholders}) AND {VISIBLE}
-                      AND EXISTS (SELECT 1 FROM story_pages p WHERE p.version_id = v.id AND p.page_no = 1)""",
-                (*unique_ids, owner, True, owner),
-            ).fetchall()
-            if len(grantable) != len(unique_ids):
-                return error(request, 404, "RESOURCE_NOT_FOUND", "包含不可授权的绘本版本")
-            now = int(time.time() * 1000)
             if row["status"] == "CREATED" and row["mode"] == "PARENT_CHILD" and row["grant_id"] is None:
+                placeholders = ",".join("?" * len(unique_ids))
+                grantable = db.execute(
+                    f"""SELECT v.id FROM story_versions v JOIN storybooks b ON b.id = v.storybook_id
+                        WHERE v.id IN ({placeholders}) AND {VISIBLE}
+                          AND EXISTS (SELECT 1 FROM story_pages p WHERE p.version_id = v.id AND p.page_no = 1)""",
+                    (*unique_ids, owner, True, owner),
+                ).fetchall()
+                if len(grantable) != len(unique_ids):
+                    return error(request, 404, "RESOURCE_NOT_FOUND", "包含不可授权的绘本版本")
                 expires_at = now + payload.timeLimitSeconds * 1000
                 child_token = secrets.token_urlsafe(32)
                 db.execute(
@@ -231,6 +243,16 @@ def update_mode_settings(payload: ModeSettings, request: Request, session_id: in
                 ]
                 if set(unique_ids) != set(existing_ids):
                     return error(request, 409, "SESSION_CONFLICT", "运行中不可修改授权绘本范围")
+                # Shortening an existing grant preserves access to LIBRARY versions that retired after issuance,
+                # while WITHDRAWN remains rejected immediately.
+                placeholders = ",".join("?" * len(existing_ids))
+                accessible = db.execute(
+                    f"""SELECT v.id FROM story_versions v JOIN storybooks b ON b.id = v.storybook_id
+                        WHERE v.id IN ({placeholders}) AND {SESSION_ACCESS}""",
+                    (*existing_ids, owner, owner),
+                ).fetchall()
+                if len(accessible) != len(existing_ids):
+                    return error(request, 404, "RESOURCE_NOT_FOUND", "授权绘本版本不可用")
                 expires_at = now + payload.timeLimitSeconds * 1000
                 if expires_at > grant["expires_at"]:
                     return error(request, 409, "SESSION_CONFLICT", "仅可缩短儿童授权时长，不可延长")
@@ -251,7 +273,8 @@ def update_mode_settings(payload: ModeSettings, request: Request, session_id: in
         "requestId": request.state.request_id,
     })
     if child_token is not None:
-        set_session_cookies(response, child_token, payload.timeLimitSeconds)
+        # Retain cookies longer than child timeLimitSeconds so API-021 parent unlock can still authenticate after expiry.
+        set_session_cookies(response, child_token, SESSION_SECONDS)
     return response
 
 
@@ -261,7 +284,7 @@ def delete_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
     try:
         with closing(connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            owner, failure = guardian(db, request, write=True)
+            owner, failure = guardian(db, request, write=True, in_write_tx=True)
             if failure:
                 return failure
             row = db.execute(
@@ -378,9 +401,14 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
     try:
         with closing(connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            principal, failure = authenticate_request(db, request, write=True)
+            principal, failure = authenticate_request(db, request, write=True, in_write_tx=True)
             if failure:
                 return failure
+            if principal.role == "GUARDIAN":
+                queue_deferred_reports(
+                    request,
+                    settle_expired_grants_in_tx(db, now=int(time.time() * 1000), guardian_id=principal.guardian_id),
+                )
             row = owned_session(db, session_id, principal)
             if not row:
                 return error(request, 404, "RESOURCE_NOT_FOUND", "会话不可用")
@@ -431,9 +459,14 @@ def finish_session(payload: Completion, request: Request, background: Background
     try:
         with closing(connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            principal, failure = authenticate_request(db, request, write=True)
+            principal, failure = authenticate_request(db, request, write=True, in_write_tx=True)
             if failure:
                 return failure
+            if principal.role == "GUARDIAN":
+                queue_deferred_reports(
+                    request,
+                    settle_expired_grants_in_tx(db, now=int(time.time() * 1000), guardian_id=principal.guardian_id),
+                )
             row = owned_session(db, session_id, principal)
             if not row:
                 return error(request, 404, "RESOURCE_NOT_FOUND", "会话不可用")

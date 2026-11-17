@@ -9,6 +9,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.api.v1.auth import authenticate_request, connect
 from app.errors import ServiceError
+from app.services.reading_reports import settle_expired_grants
 from app.services.voice_access import VoicePrincipal
 
 
@@ -20,6 +21,7 @@ class GuardianVoiceAuthenticator:
     @staticmethod
     def _authenticate(request: Request, *, write: bool) -> VoicePrincipal:
         try:
+            settle_expired_grants(request)
             with closing(connect()) as db:
                 principal, failure = authenticate_request(db, request, write=write)
         except sqlite3.Error:

@@ -7,6 +7,7 @@ from typing import Literal
 from fastapi import APIRouter, Path, Query, Request
 
 from app.api.v1.auth import authenticate_request, connect, error
+from app.services.reading_reports import settle_expired_grants
 
 router = APIRouter(prefix="/api/v1")
 AgeBand = Literal["AGE_3_4", "AGE_4_5", "AGE_5_6"]
@@ -49,6 +50,7 @@ def list_storybooks(request: Request, age_band: AgeBand | None = Query(default=N
                     page: int = Query(default=1, ge=1, le=9007199254740991),
                     page_size: int = Query(default=20, ge=1, le=50, alias="pageSize")):
     try:
+        settle_expired_grants(request)
         with closing(connect()) as db:
             db.execute("BEGIN")
             principal, failure = authenticate_request(db, request, write=False)
@@ -84,6 +86,7 @@ def list_storybooks(request: Request, age_band: AgeBand | None = Query(default=N
 @router.get("/story-versions/{version_id}")
 def get_story_version(request: Request, version_id: int = Path(ge=1, le=9007199254740991)):
     try:
+        settle_expired_grants(request)
         with closing(connect()) as db:
             db.execute("BEGIN")
             principal, failure = authenticate_request(db, request, write=False)

@@ -14,10 +14,10 @@ import threading
 import time
 from contextlib import closing
 from pathlib import Path
+from uuid import uuid4
 
-from app.api.v1.auth import connect
 from app.core.config import database_path
-from app.db.connection import database_ready
+from app.db.connection import connect, database_ready
 
 logger = logging.getLogger("zhiya.reports")
 MAX_SUMMARY_CHARS = 500
@@ -157,3 +157,118 @@ def recover_pending_reports() -> bool:
     """Single-worker startup recovery called by lifespan before readiness."""
     reset_recovery_state()
     return ensure_startup_recovered()
+
+
+def _expired_sessions_query(*, guardian_id: int | None = None, grant_id: int | None = None) -> tuple[str, list[object]]:
+    filters = ["g.revoked_at IS NULL", "g.expires_at <= ?", "s.status IN ('CREATED', 'IN_PROGRESS')"]
+    params: list[object] = []
+    if guardian_id is not None:
+        filters.append("p.guardian_id = ?")
+        params.append(guardian_id)
+    if grant_id is not None:
+        filters.append("g.id = ?")
+        params.append(grant_id)
+    where = " AND ".join(filters)
+    sql = (
+        "SELECT s.id, s.version_id, s.visited_pages_json, p.guardian_id "
+        "FROM reading_sessions s "
+        "JOIN child_grants g ON g.id = s.grant_id "
+        "JOIN child_profiles p ON p.id = s.profile_id "
+        f"WHERE {where}"
+    )
+    return sql, params
+
+
+def settle_expired_grants_in_tx(
+    db: sqlite3.Connection,
+    *,
+    now: int,
+    guardian_id: int | None = None,
+    grant_id: int | None = None,
+) -> list[tuple[int, str, list[str], str]]:
+    """Finalize unfinished sessions tied to expired child grants as FINISHED (TIME_LIMIT).
+
+    Must run inside an active BEGIN IMMEDIATE transaction. Returns pending report generation jobs
+    only for sessions transitioned in this transaction so duplicate checks never trigger repeat work.
+    """
+    sql, extra_params = _expired_sessions_query(guardian_id=guardian_id, grant_id=grant_id)
+    rows = db.execute(sql, (now, *extra_params)).fetchall()
+    if not rows:
+        return []
+    if not ensure_startup_recovered():
+        raise sqlite3.OperationalError("report recovery pending")
+    pending: list[tuple[int, str, list[str], str]] = []
+    for row in rows:
+        sid = row["id"]
+        updated = db.execute(
+            """UPDATE reading_sessions
+               SET status = 'FINISHED', end_reason = 'TIME_LIMIT', ended_at = ?, revision = revision + 1
+               WHERE id = ? AND status IN ('CREATED', 'IN_PROGRESS')""",
+            (now, sid),
+        )
+        if updated.rowcount != 1:
+            continue
+        visited = json.loads(row["visited_pages_json"])
+        facts = fact_summary(visited)
+        inserted = db.execute(
+            """INSERT OR IGNORE INTO reading_reports (session_id, status, summary, activities_json, updated_at)
+               VALUES (?, 'PENDING', ?, '[]', ?)""",
+            (sid, facts, now),
+        )
+        if inserted.rowcount != 1:
+            continue
+        generation_token = str(uuid4())
+        db.execute(
+            """INSERT INTO request_executions
+               (owner_account_id, session_id, scope_type, scope_id, client_request_id, request_digest,
+                status, execution_token, started_at, deadline_at, completed_at, response_status, response_body)
+               VALUES (?, ?, 'SESSION_EVENT', ?, ?, '__time_limit__', 'SUCCEEDED', ?, ?, ?, ?, 200, '{}')""",
+            (
+                row["guardian_id"],
+                sid,
+                sid,
+                f"__time_limit__:{sid}:{generation_token[:16]}",
+                generation_token,
+                now,
+                now + 25000,
+                now,
+            ),
+        )
+        pages = list(dict.fromkeys(visited))
+        texts = [
+            r[0]
+            for r in db.execute(
+                "SELECT sp.body_text FROM story_pages sp "
+                "JOIN story_versions sv ON sv.id = sp.version_id "
+                "WHERE sp.version_id = ? AND sv.status <> 'WITHDRAWN' AND sp.page_no IN (%s) ORDER BY sp.page_no"
+                % ",".join("?" * len(pages)),
+                (row["version_id"], *pages),
+            )
+        ] if pages else []
+        pending.append((sid, facts, texts, generation_token))
+    return pending
+
+
+def queue_deferred_reports(request, pending: list[tuple[int, str, list[str], str]]) -> None:
+    if request is None or not pending:
+        return
+    queue = getattr(request.state, "deferred_reports", None)
+    if queue is None:
+        queue = []
+        request.state.deferred_reports = queue
+    adapter = getattr(request.app.state, "model_adapter", None)
+    for sid, facts, texts, gen_token in pending:
+        queue.append((generate_report, (sid, facts, texts, adapter), {"generation_token": gen_token}))
+
+
+def settle_expired_grants(request, *, guardian_id: int | None = None, grant_id: int | None = None) -> None:
+    """Best-effort pre-read check that atomically finishes expired child-grant sessions at most once."""
+    now = int(time.time() * 1000)
+    sql, extra_params = _expired_sessions_query(guardian_id=guardian_id, grant_id=grant_id)
+    with closing(connect()) as reader:
+        if not reader.execute(f"SELECT 1 FROM ({sql}) LIMIT 1", (now, *extra_params)).fetchone():
+            return
+    with closing(connect()) as write_db, write_db:
+        write_db.execute("BEGIN IMMEDIATE")
+        pending = settle_expired_grants_in_tx(write_db, now=now, guardian_id=guardian_id, grant_id=grant_id)
+    queue_deferred_reports(request, pending)
