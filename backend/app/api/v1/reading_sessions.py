@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.api.v1.auth import connect, error
 from app.api.v1.profiles import guardian
 from app.api.v1.storybooks import VISIBLE
-from app.services.reading_reports import fact_summary, generate_report, report_object
+from app.services.reading_reports import ensure_startup_recovered, fact_summary, generate_report, report_object
 
 router = APIRouter(prefix="/api/v1/reading-sessions")
 MAX_ID = 9007199254740991
@@ -273,6 +273,9 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
 def finish_session(payload: Completion, request: Request, background: BackgroundTasks,
                    session_id: int = Path(ge=1, le=MAX_ID)):
     """API-019 USER_FINISH (DCL-006 candidate rules). Report generation runs after commit."""
+    # Recovery has its own write transaction and must finish before any new PENDING report exists.
+    if not ensure_startup_recovered():
+        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "阅读小结服务暂不可用", retryable=True)
     digest = request_digest(f"/api/v1/reading-sessions/{session_id}/completions", payload.model_dump())
     try:
         with closing(connect()) as db, db:

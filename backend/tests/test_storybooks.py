@@ -1,5 +1,6 @@
 """Permission, filtering and serialization checks for the guardian bookshelf."""
 
+import asyncio
 import sqlite3
 import hashlib
 import json
@@ -7,6 +8,7 @@ import time
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 from fastapi.testclient import TestClient
@@ -529,3 +531,58 @@ def test_startup_recovery_stays_unready_while_locked_and_recovers_after_release(
         assert db.execute(
             "SELECT status, summary, activities_json FROM reading_reports WHERE session_id = ?", (pending,)
         ).fetchone() == ("FAILED", "事实摘要", "[]")
+
+
+def test_delayed_recovery_preserves_a_new_report_during_generation(bookshelf, monkeypatch):
+    from app.schemas.agent import ModelGenerateResult
+
+    first, _, path = bookshelf
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    leftover = _started_session(first, headers, path, pages=1)
+    active = _started_session(first, headers, path, pages=1)
+    url = f"/api/v1/reading-sessions/{active}"
+    assert first.post(f"{url}/events", headers=headers, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start",
+    }).status_code == 201
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("INSERT INTO reading_reports VALUES (?, 'PENDING', '遗留事实摘要', '[]', 1)", (leftover,))
+
+    model_started, model_release = Event(), Event()
+
+    class PausedAdapter:
+        async def generate(self, request):
+            model_started.set()
+            assert await asyncio.to_thread(model_release.wait, 10)
+            return ModelGenerateResult(success=True, text="家长和孩子一起读完了第一页。")
+
+    finish = {"reason": "USER_FINISH", "expectedRevision": 1, "clientEventId": "finish"}
+    with closing(sqlite3.connect(path)) as locker:
+        locker.execute("BEGIN IMMEDIATE")
+        with TestClient(app, base_url="https://testserver") as client:
+            client.cookies.update(first.cookies)
+            monkeypatch.setattr(app.state, "model_adapter", PausedAdapter())
+            assert client.get("/api/v1/health").status_code == 503
+            unavailable = client.post(f"{url}/completions", headers=headers, json=finish)
+            assert unavailable.status_code == 503 and unavailable.json()["error"]["retryable"] is True
+            assert client.get(url).json()["data"]["session"]["status"] == "IN_PROGRESS"
+            assert not model_started.is_set()
+            locker.rollback()
+
+            # Complete the first business request before probing readiness again.
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pending_response = pool.submit(client.post, f"{url}/completions", headers=headers, json=finish)
+                try:
+                    assert model_started.wait(5)
+                    assert client.get("/api/v1/health").status_code == 200
+                    report = client.get(url).json()["data"]["report"]
+                    assert report["status"] == "PENDING"
+                finally:
+                    model_release.set()
+                assert pending_response.result(timeout=10).status_code == 200
+            report = client.get(url).json()["data"]["report"]
+            assert (report["status"], report["summary"]) == ("READY", "家长和孩子一起读完了第一页。")
+
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute(
+            "SELECT status, summary FROM reading_reports WHERE session_id = ?", (leftover,)
+        ).fetchone() == ("FAILED", "遗留事实摘要")
