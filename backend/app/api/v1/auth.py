@@ -8,6 +8,9 @@ import threading
 import time
 from collections import defaultdict, deque
 from contextlib import closing
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
@@ -81,6 +84,77 @@ def valid_csrf(request: Request, token: str) -> bool:
     return supplied.isascii() and hmac.compare_digest(supplied, csrf_for(token))
 
 
+@dataclass(frozen=True)
+class Principal:
+    guardian_id: int
+    role: Literal["GUARDIAN", "CHILD"]
+    auth_session_id: int | None = None
+    grant_id: int | None = None
+    profile_id: int | None = None
+    grant_expires_at: int | None = None
+
+
+def iso_utc(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def set_session_cookies(response: Response, token: str, max_age: int) -> None:
+    response.set_cookie(SESSION_COOKIE, token, max_age=max_age, secure=True,
+                        httponly=True, samesite="lax", path="/")
+    response.set_cookie(CSRF_COOKIE, csrf_for(token), max_age=max_age, secure=True,
+                        httponly=False, samesite="lax", path="/")
+
+
+def authenticate_request(db, request: Request, *, write: bool, allow_expired_child: bool = False):
+    """Authenticate either a live guardian auth_session or an active child_grant."""
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token:
+        return None, error(request, 401, "AUTH_REQUIRED", "请先登录")
+    now = int(time.time() * 1000)
+    digest = token_digest(token)
+    guardian_row = db.execute(
+        """SELECT s.id AS session_id, a.id AS account_id, a.role
+           FROM auth_sessions s JOIN accounts a ON a.id = s.account_id
+           WHERE s.token_digest = ? AND s.revoked_at IS NULL AND s.expires_at > ?""",
+        (digest, now),
+    ).fetchone()
+    if guardian_row:
+        if guardian_row["role"] != "GUARDIAN":
+            return None, error(request, 403, "FORBIDDEN", "当前账号不能执行此操作")
+        if write and not valid_csrf(request, token):
+            return None, error(request, 403, "CSRF_INVALID", "请求校验失败")
+        return Principal(guardian_id=guardian_row["account_id"], role="GUARDIAN",
+                         auth_session_id=guardian_row["session_id"]), None
+    expiry_clause = "" if allow_expired_child else " AND g.expires_at > ?"
+    params = (digest, now) if allow_expired_child else (digest, now, now)
+    child_row = db.execute(
+        f"""SELECT g.id AS grant_id, g.profile_id, g.expires_at, p.guardian_id
+            FROM child_grants g
+            JOIN child_profiles p ON p.id = g.profile_id
+            JOIN accounts a ON a.id = p.guardian_id
+            WHERE g.token_digest = ? AND g.revoked_at IS NULL AND g.issued_at <= ?
+              AND a.role = 'GUARDIAN'{expiry_clause}""",
+        params,
+    ).fetchone()
+    if child_row:
+        if write and not valid_csrf(request, token):
+            return None, error(request, 403, "CSRF_INVALID", "请求校验失败")
+        return Principal(guardian_id=child_row["guardian_id"], role="CHILD",
+                         grant_id=child_row["grant_id"], profile_id=child_row["profile_id"],
+                         grant_expires_at=child_row["expires_at"]), None
+    return None, error(request, 401, "AUTH_REQUIRED", "请先登录")
+
+
+def revoke_grant_and_interrupt(db, grant_id: int, now: int) -> None:
+    db.execute("UPDATE child_grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", (now, grant_id))
+    db.execute(
+        """UPDATE reading_sessions SET status = 'INTERRUPTED', end_reason = 'GRANT_REVOKED',
+           ended_at = ?, revision = revision + 1
+           WHERE grant_id = ? AND status IN ('CREATED', 'IN_PROGRESS')""",
+        (now, grant_id),
+    )
+
+
 def allowed_login(client: str) -> bool:
     now = time.monotonic()
     with _login_lock:
@@ -140,37 +214,72 @@ def login(payload: Credentials, request: Request):
     response = JSONResponse(status_code=201, content={
         "data": {"accountId": account_id}, "requestId": request.state.request_id
     })
-    response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_SECONDS, secure=True,
-                        httponly=True, samesite="lax", path="/")
-    response.set_cookie(CSRF_COOKIE, csrf_for(token), max_age=SESSION_SECONDS, secure=True,
-                        httponly=False, samesite="lax", path="/")
+    set_session_cookies(response, token, SESSION_SECONDS)
     return response
 
 
 @router.delete("/sessions/current", status_code=204)
 def logout(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
-    if not token:
-        return error(request, 401, "AUTH_REQUIRED", "请先登录")
-    if not valid_csrf(request, token):
-        return error(request, 403, "CSRF_INVALID", "请求校验失败")
     now = int(time.time() * 1000)
     try:
         with closing(connect()) as db, db:
-            session = db.execute(
-                "SELECT id FROM auth_sessions WHERE token_digest = ? AND revoked_at IS NULL AND expires_at > ?",
-                (token_digest(token), now),
-            ).fetchone()
-            if not session:
-                return error(request, 401, "AUTH_REQUIRED", "请先登录")
-            db.execute("UPDATE auth_sessions SET revoked_at = ? WHERE id = ?", (now, session["id"]))
-            db.execute(
-                "UPDATE child_grants SET revoked_at = ? WHERE issued_by_session_id = ? AND revoked_at IS NULL",
-                (now, session["id"]),
-            )
+            db.execute("BEGIN IMMEDIATE")
+            principal, failure = authenticate_request(db, request, write=True, allow_expired_child=True)
+            if failure:
+                return failure
+            if principal.role == "GUARDIAN":
+                db.execute("UPDATE auth_sessions SET revoked_at = ? WHERE id = ?",
+                           (now, principal.auth_session_id))
+                grant_ids = [r[0] for r in db.execute(
+                    "SELECT id FROM child_grants WHERE issued_by_session_id = ? AND revoked_at IS NULL",
+                    (principal.auth_session_id,),
+                )]
+                for gid in grant_ids:
+                    revoke_grant_and_interrupt(db, gid, now)
+            else:
+                revoke_grant_and_interrupt(db, principal.grant_id, now)
     except sqlite3.Error:
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
     response = Response(status_code=204)
     response.delete_cookie(SESSION_COOKIE, secure=True, httponly=True, samesite="lax", path="/")
     response.delete_cookie(CSRF_COOKIE, secure=True, samesite="lax", path="/")
+    return response
+
+
+@router.post("/parent-unlocks")
+def parent_unlock(payload: Credentials, request: Request):
+    """API-021: re-authenticate guardian to exit child mode, revoke grant and issue a fresh session."""
+    client = request.client.host if request.client else "unknown"
+    now = int(time.time() * 1000)
+    try:
+        with closing(connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            principal, failure = authenticate_request(db, request, write=True, allow_expired_child=True)
+            if failure:
+                return failure
+            if principal.role != "CHILD":
+                return error(request, 403, "FORBIDDEN", "当前会话不在儿童模式")
+            if not allowed_login(client):
+                return error(request, 429, "RATE_LIMITED", "尝试次数过多，请稍后再试", retryable=True,
+                             headers={"Retry-After": str(LOGIN_WINDOW)})
+            account = db.execute(
+                "SELECT id, password_hash, role FROM accounts WHERE account = ?", (payload.account,)
+            ).fetchone()
+            stored = account["password_hash"] if account else password_hash("dummy-password")
+            if (not password_matches(payload.password, stored) or not account
+                    or account["role"] != "GUARDIAN" or account["id"] != principal.guardian_id):
+                return error(request, 401, "INVALID_CREDENTIALS", "账号或密码错误")
+            revoke_grant_and_interrupt(db, principal.grant_id, now)
+            new_token = secrets.token_urlsafe(32)
+            db.execute(
+                "INSERT INTO auth_sessions (account_id, token_digest, expires_at) VALUES (?, ?, ?)",
+                (account["id"], token_digest(new_token), now + SESSION_SECONDS * 1000),
+            )
+            account_id = account["id"]
+    except sqlite3.Error:
+        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
+    response = JSONResponse(status_code=200, content={
+        "data": {"accountId": account_id}, "requestId": request.state.request_id
+    })
+    set_session_cookies(response, new_token, SESSION_SECONDS)
     return response

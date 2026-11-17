@@ -6,8 +6,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Path, Query, Request
 
-from app.api.v1.auth import connect, error
-from app.api.v1.profiles import guardian
+from app.api.v1.auth import authenticate_request, connect, error
 
 router = APIRouter(prefix="/api/v1")
 AgeBand = Literal["AGE_3_4", "AGE_4_5", "AGE_5_6"]
@@ -52,11 +51,16 @@ def list_storybooks(request: Request, age_band: AgeBand | None = Query(default=N
     try:
         with closing(connect()) as db:
             db.execute("BEGIN")
-            owner, failure = guardian(db, request, write=False)
+            principal, failure = authenticate_request(db, request, write=False)
             if failure:
                 return failure
+            if principal.role == "CHILD" and scope == "mine":
+                return error(request, 403, "FORBIDDEN", "儿童模式不支持查看个人历史书架")
             conditions = [VISIBLE]
-            params = [owner, scope == "mine", owner]
+            params = [principal.guardian_id, scope == "mine" or principal.role == "CHILD", principal.guardian_id]
+            if principal.role == "CHILD":
+                conditions.append("EXISTS (SELECT 1 FROM child_grant_books gb WHERE gb.grant_id = ? AND gb.version_id = v.id)")
+                params.append(principal.grant_id)
             if age_band:
                 low, high = AGES[age_band]
                 conditions.append("v.age_min <= ? AND v.age_max >= ?")
@@ -82,17 +86,32 @@ def get_story_version(request: Request, version_id: int = Path(ge=1, le=90071992
     try:
         with closing(connect()) as db:
             db.execute("BEGIN")
-            owner, failure = guardian(db, request, write=False)
+            principal, failure = authenticate_request(db, request, write=False)
             if failure:
                 return failure
+            grant_filter = (
+                "AND EXISTS (SELECT 1 FROM child_grant_books gb WHERE gb.grant_id = ? AND gb.version_id = v.id) "
+                if principal.role == "CHILD" else ""
+            )
+            active_session_filter = (
+                "EXISTS (SELECT 1 FROM reading_sessions s WHERE s.version_id = v.id AND s.grant_id = ? "
+                "AND s.profile_id = ? AND s.status IN ('CREATED', 'IN_PROGRESS'))"
+                if principal.role == "CHILD"
+                else "EXISTS (SELECT 1 FROM reading_sessions s JOIN child_profiles p ON p.id = s.profile_id "
+                     "WHERE s.version_id = v.id AND p.guardian_id = ? AND s.status IN ('CREATED', 'IN_PROGRESS'))"
+            )
+            params = (
+                (version_id, principal.grant_id, principal.guardian_id, True, principal.guardian_id,
+                 principal.grant_id, principal.profile_id)
+                if principal.role == "CHILD"
+                else (version_id, principal.guardian_id, True, principal.guardian_id, principal.guardian_id)
+            )
             row = db.execute(
                 "SELECT v.* FROM story_versions v JOIN storybooks b ON b.id = v.storybook_id "
-                "WHERE v.id = ? AND (" + VISIBLE +
+                f"WHERE v.id = ? {grant_filter}AND (" + VISIBLE +
                 " OR (v.status = 'RETIRED' AND v.reviewed_by_id IS NOT NULL AND v.reviewed_at IS NOT NULL "
-                "AND b.source_type = 'LIBRARY' "
-                "AND EXISTS (SELECT 1 FROM reading_sessions s JOIN child_profiles p ON p.id = s.profile_id "
-                "WHERE s.version_id = v.id AND p.guardian_id = ? AND s.status IN ('CREATED', 'IN_PROGRESS'))))",
-                (version_id, owner, True, owner, owner),
+                f"AND b.source_type = 'LIBRARY' AND {active_session_filter}))",
+                params,
             ).fetchone()
             if not row:
                 return error(request, 404, "RESOURCE_NOT_FOUND", "绘本不可用")
