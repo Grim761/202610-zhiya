@@ -1,16 +1,20 @@
 """Tests for API-007 (delete child profile) and API-014 (delete reading session) cleanup."""
 
+import asyncio
+import json
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
+from threading import Event
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.api.v1.auth import _login_attempts
 from app.main import app
+from app.schemas.agent import ModelGenerateResult
 from app.services.voice_access import VoicePrincipal, VoiceSnapshot
 
 SCHEMA = Path(__file__).resolve().parents[2] / "database" / "schema.sql"
@@ -43,7 +47,7 @@ def env(tmp_path, monkeypatch):
                  topics_json, task_types_json, content, status, reviewed_at, created_at)
                 VALUES (100, 1, 'k1', 'k', 'src', 'ref', 'L1', NULL, '[]', '["GUIDANCE"]', 'body', 'APPROVED', 1, 1)""")
         yield first, second, path
-    app.state.voice_media.items.clear()
+    app.state.voice_media.clear()
     _login_attempts.clear()
 
 
@@ -209,3 +213,144 @@ def test_concurrent_deletes_and_non_guardian_forbidden(env):
     ):
         assert res.status_code == 403 and res.json()["error"]["code"] == "FORBIDDEN"
         assert res.json()["requestId"] == res.headers["X-Request-ID"]
+
+
+@pytest.mark.parametrize("delete_target, stale_result, stale_exc", [
+    ("session", ModelGenerateResult(success=True, text=json.dumps({"suggestionId": "TALK_ABOUT_STORY"})), None),
+    ("profile", None, RuntimeError("stale boom")),
+])
+def test_stale_report_task_does_not_overwrite_reused_session_id(env, monkeypatch, delete_target, stale_result, stale_exc):
+    first, second, path = env
+    headers1 = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    headers2 = {"X-CSRF-Token": second.cookies["zhiya_csrf"]}
+    p1 = first.post("/api/v1/child-profiles", headers=headers1,
+                    json={"ageBand": "AGE_3_4", "preferredMinutes": 10}).json()["data"]["childProfileId"]
+    p2 = second.post("/api/v1/child-profiles", headers=headers2,
+                     json={"ageBand": "AGE_4_5", "preferredMinutes": 10}).json()["data"]["childProfileId"]
+    sid1 = first.post("/api/v1/reading-sessions", headers=headers1, json={
+        "childProfileId": p1, "storyVersionId": 11, "mode": "PARENT_CHILD",
+    }).json()["data"]["readingSessionId"]
+    assert first.post(f"/api/v1/reading-sessions/{sid1}/events", headers=headers1, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start-1",
+    }).status_code == 201
+
+    g1_started, g1_release = Event(), Event()
+    g2_started, g2_release = Event(), Event()
+
+    class PausedAdapter:
+        def __init__(self, started: Event, release: Event, result=None, exc=None):
+            self.started, self.release, self.result, self.exc = started, release, result, exc
+
+        async def generate(self, request):
+            self.started.set()
+            assert await asyncio.to_thread(self.release.wait, 10)
+            if self.exc is not None:
+                raise self.exc
+            return self.result
+
+    current_adapter = [PausedAdapter(g1_started, g1_release, result=stale_result, exc=stale_exc)]
+
+    class SwitchingAdapter:
+        async def generate(self, request):
+            return await current_adapter[0].generate(request)
+
+    monkeypatch.setattr(app.state, "model_adapter", SwitchingAdapter(), raising=False)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(first.post, f"/api/v1/reading-sessions/{sid1}/completions", headers=headers1,
+                         json={"reason": "USER_FINISH", "expectedRevision": 1, "clientEventId": "end-1"})
+        try:
+            assert g1_started.wait(5)
+            del_url = f"/api/v1/reading-sessions/{sid1}" if delete_target == "session" else f"/api/v1/child-profiles/{p1}"
+            assert first.delete(del_url, headers=headers1).status_code == 204
+
+            sid2 = second.post("/api/v1/reading-sessions", headers=headers2, json={
+                "childProfileId": p2, "storyVersionId": 11, "mode": "PARENT_CHILD",
+            }).json()["data"]["readingSessionId"]
+            assert sid2 == sid1  # Ensure SQLite reused the deleted reading_sessions.id.
+            assert second.post(f"/api/v1/reading-sessions/{sid2}/events", headers=headers2, json={
+                "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start-2",
+            }).status_code == 201
+
+            current_adapter[0] = PausedAdapter(
+                g2_started, g2_release,
+                result=ModelGenerateResult(success=True, text=json.dumps({"suggestionId": "REVISIT_PAGE"})),
+            )
+            f2 = pool.submit(second.post, f"/api/v1/reading-sessions/{sid2}/completions", headers=headers2,
+                             json={"reason": "USER_FINISH", "expectedRevision": 1, "clientEventId": "end-2"})
+            try:
+                assert g2_started.wait(5)
+            finally:
+                g1_release.set()
+            assert f1.result(timeout=10).status_code == 200
+
+            pending_view = second.get(f"/api/v1/reading-sessions/{sid2}").json()["data"]["report"]
+            assert pending_view == {
+                "readingSessionId": sid2,
+                "summary": "本次共读阅读了第 1 页。",
+                "activities": [],
+                "status": "PENDING",
+            }
+        finally:
+            g1_release.set()
+            g2_release.set()
+        assert f2.result(timeout=10).status_code == 200
+
+    final_view = second.get(f"/api/v1/reading-sessions/{sid2}").json()["data"]["report"]
+    assert final_view == {
+        "readingSessionId": sid2,
+        "summary": "本次共读阅读了第 1 页。可以和孩子再看一页已读内容，由孩子自愿选择是否聊一聊。",
+        "activities": [],
+        "status": "READY",
+    }
+
+
+def test_concurrent_voice_media_expire_and_delete_does_not_fail_get(env):
+    first, second, _ = env
+    headers1 = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    headers2 = {"X-CSRF-Token": second.cookies["zhiya_csrf"]}
+    p1 = first.post("/api/v1/child-profiles", headers=headers1,
+                    json={"ageBand": "AGE_3_4", "preferredMinutes": 10}).json()["data"]["childProfileId"]
+    p2 = second.post("/api/v1/child-profiles", headers=headers2,
+                     json={"ageBand": "AGE_4_5", "preferredMinutes": 10}).json()["data"]["childProfileId"]
+    sid_keep = first.post("/api/v1/reading-sessions", headers=headers1, json={
+        "childProfileId": p1, "storyVersionId": 11, "mode": "PARENT_CHILD",
+    }).json()["data"]["readingSessionId"]
+    sid_del = second.post("/api/v1/reading-sessions", headers=headers2, json={
+        "childProfileId": p2, "storyVersionId": 11, "mode": "PARENT_CHILD",
+    }).json()["data"]["readingSessionId"]
+    for client, hdrs, sid, cid in ((first, headers1, sid_keep, "start-keep"), (second, headers2, sid_del, "start-del")):
+        assert client.post(f"/api/v1/reading-sessions/{sid}/events", headers=hdrs, json={
+            "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": cid,
+        }).status_code == 201
+
+    keep_key, _ = app.state.voice_media.put(
+        VoicePrincipal(1), VoiceSnapshot(sid_keep, 11, 1, 1, "p1"), "v", "NORMAL", "m", b"WAV-KEEP",
+    )
+    del_key, del_item = app.state.voice_media.put(
+        VoicePrincipal(2), VoiceSnapshot(sid_del, 11, 1, 1, "p1"), "v", "NORMAL", "m", b"WAV-DEL",
+    )
+
+    expire_checked, purge_done = Event(), Event()
+
+    class _BlockingExpiry:
+        def __le__(self, other: float) -> bool:
+            expire_checked.set()
+            purge_done.wait(0.2)
+            return True
+
+    app.state.voice_media.items[del_key] = type(del_item)(
+        del_item.principal, del_item.snapshot, del_item.voice_id, del_item.speech_rate,
+        del_item.model, del_item.audio, _BlockingExpiry(),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_get = pool.submit(first.get, f"/api/v1/media/{keep_key}")
+        assert expire_checked.wait(5)
+        f_del = pool.submit(second.delete, f"/api/v1/reading-sessions/{sid_del}", headers=headers2)
+        del_resp = f_del.result(timeout=10)
+        purge_done.set()
+        get_resp = f_get.result(timeout=10)
+
+    assert del_resp.status_code == 204
+    assert get_resp.status_code == 200 and get_resp.content == b"WAV-KEEP"
+    assert [v.snapshot.session_id for v in app.state.voice_media.items.values()] == [sid_keep]

@@ -30,5 +30,9 @@ def purge_voice_media(app_state, session_ids: Iterable[int]) -> None:
     store = getattr(app_state, "voice_media", None)
     if store is None:
         return
+    purge = getattr(store, "purge_sessions", None)
+    if purge is not None:
+        purge(targets)
+        return
     for key in [k for k, v in list(store.items.items()) if v.snapshot.session_id in targets]:
         store.items.pop(key, None)
