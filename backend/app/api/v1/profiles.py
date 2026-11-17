@@ -9,7 +9,7 @@ from typing import Literal
 from fastapi import APIRouter, Path, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.api.v1.auth import SESSION_COOKIE, connect, error, token_digest, valid_csrf
+from app.api.v1.auth import Principal, authenticate_request, connect, error
 from app.services.cleanup import delete_session_rows, purge_voice_media
 
 router = APIRouter(prefix="/api/v1/child-profiles")
@@ -66,22 +66,20 @@ class ProfileUpdate(ProfileFields):
         return self
 
 
+def guardian_session(db, request: Request, *, write: bool) -> tuple[Principal | None, object]:
+    principal, failure = authenticate_request(db, request, write=write)
+    if failure:
+        return None, failure
+    if principal.role != "GUARDIAN":
+        return None, error(request, 403, "FORBIDDEN", "当前为儿童模式，仅限家长操作")
+    return principal, None
+
+
 def guardian(db, request: Request, *, write: bool):
-    token = request.cookies.get(SESSION_COOKIE)
-    if not token:
-        return None, error(request, 401, "AUTH_REQUIRED", "请先登录")
-    row = db.execute(
-        """SELECT a.id, a.role FROM auth_sessions s JOIN accounts a ON a.id = s.account_id
-           WHERE s.token_digest = ? AND s.revoked_at IS NULL AND s.expires_at > ?""",
-        (token_digest(token), int(time.time() * 1000)),
-    ).fetchone()
-    if not row:
-        return None, error(request, 401, "AUTH_REQUIRED", "请先登录")
-    if row["role"] != "GUARDIAN":
-        return None, error(request, 403, "FORBIDDEN", "当前账号不能操作儿童档案")
-    if write and not valid_csrf(request, token):
-        return None, error(request, 403, "CSRF_INVALID", "请求校验失败")
-    return row["id"], None
+    principal, failure = guardian_session(db, request, write=write)
+    if failure:
+        return None, failure
+    return principal.guardian_id, None
 
 
 def serialize(row):
