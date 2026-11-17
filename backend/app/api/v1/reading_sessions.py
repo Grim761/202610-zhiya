@@ -9,13 +9,14 @@ from datetime import datetime, timezone
 from typing import Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Path, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Path, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.v1.auth import connect, error
 from app.api.v1.profiles import guardian
 from app.api.v1.storybooks import VISIBLE
+from app.services.cleanup import delete_session_rows, purge_voice_media
 from app.services.reading_reports import fact_summary, generate_report, report_object
 
 router = APIRouter(prefix="/api/v1/reading-sessions")
@@ -152,6 +153,36 @@ def get_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
                              "report": report_object(session_id, report)}, "requestId": request.state.request_id}
     except sqlite3.Error:
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
+
+
+@router.delete("/{session_id}", status_code=204)
+def delete_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
+    """API-014: delete a guardian-owned reading session, its derived rows, and revoke its active grant."""
+    try:
+        with closing(connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            owner, failure = guardian(db, request, write=True)
+            if failure:
+                return failure
+            row = db.execute(
+                """SELECT s.id, s.grant_id FROM reading_sessions s
+                JOIN child_profiles p ON p.id = s.profile_id
+                WHERE s.id = ? AND p.guardian_id = ?""",
+                (session_id, owner),
+            ).fetchone()
+            if not row:
+                return error(request, 404, "RESOURCE_NOT_FOUND", "会话不可用")
+            now = int(time.time() * 1000)
+            delete_session_rows(db, session_id)
+            if row["grant_id"] is not None:
+                db.execute(
+                    "UPDATE child_grants SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?",
+                    (now, row["grant_id"]),
+                )
+    except sqlite3.Error:
+        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
+    purge_voice_media(request.app.state, [session_id])
+    return Response(status_code=204)
 
 
 def request_digest(path: str, body: dict) -> str:
