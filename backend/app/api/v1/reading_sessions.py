@@ -82,7 +82,7 @@ def create_session(payload: SessionCreate, request: Request):
                 (payload.storyVersionId, owner, True, owner),
             ).fetchone()
             if not profile or not version:
-                return error(404, "RESOURCE_NOT_FOUND", "档案或绘本不可用")
+                return error(request, 404, "RESOURCE_NOT_FOUND", "档案或绘本不可用")
             cursor = db.execute(
                 """INSERT INTO reading_sessions
                 (profile_id, version_id, current_page_no, mode, status, created_at)
@@ -91,9 +91,9 @@ def create_session(payload: SessionCreate, request: Request):
             )
             row = db.execute("SELECT *, NULL AS grant_expires_at FROM reading_sessions WHERE id = ?",
                              (cursor.lastrowid,)).fetchone()
-            return {"data": session_object(row), "requestId": str(uuid4())}
+            return {"data": session_object(row), "requestId": request.state.request_id}
     except sqlite3.Error:
-        return error(503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
+        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
 
 
 @router.get("")
@@ -117,9 +117,9 @@ def list_sessions(request: Request, page: int = Query(default=1, ge=1, le=MAX_ID
                 (owner, owner, owner, pageSize, offset),
             ).fetchall()
             return {"data": {"items": [session_object(row) for row in rows],
-                             "page": page, "pageSize": pageSize}, "requestId": str(uuid4())}
+                             "page": page, "pageSize": pageSize}, "requestId": request.state.request_id}
     except sqlite3.Error:
-        return error(503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
+        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
 
 
 @router.get("/{session_id}")
@@ -140,7 +140,7 @@ def get_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
                 (session_id, owner, owner, owner),
             ).fetchone()
             if not row:
-                return error(404, "RESOURCE_NOT_FOUND", "会话不可用")
+                return error(request, 404, "RESOURCE_NOT_FOUND", "会话不可用")
             events = db.execute(
                 "SELECT id, event_type, page_no FROM interaction_events WHERE session_id = ? ORDER BY id",
                 (session_id,),
@@ -149,9 +149,9 @@ def get_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
             return {"data": {"session": session_object(row),
                              "events": [{"interactionEventId": e["id"], "eventType": e["event_type"],
                                          "pageNumber": e["page_no"]} for e in events],
-                             "report": report_object(session_id, report)}, "requestId": str(uuid4())}
+                             "report": report_object(session_id, report)}, "requestId": request.state.request_id}
     except sqlite3.Error:
-        return error(503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
+        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
 
 
 def request_digest(path: str, body: dict) -> str:
@@ -171,7 +171,7 @@ def owned_session(db, session_id: int, owner: int):
     ).fetchone()
 
 
-def replay_session_event(db, session_id: int, client_event_id: str, digest: str):
+def replay_session_event(db, request: Request, session_id: int, client_event_id: str, digest: str):
     """Shared SESSION_EVENT lookup for events/completions (and later questions/guidance/branches).
 
     Returns a response when the key was already used, otherwise None.
@@ -183,20 +183,20 @@ def replay_session_event(db, session_id: int, client_event_id: str, digest: str)
     if not previous:
         return None
     if previous["request_digest"] != digest:
-        return error(409, "IDEMPOTENCY_CONFLICT", "请求标识已用于其他操作")
+        return error(request, 409, "IDEMPOTENCY_CONFLICT", "请求标识已用于其他操作")
     if previous["status"] == "RUNNING":
         now = int(time.time() * 1000)
         if previous["deadline_at"] <= now:
-            failure = error(504, "REQUEST_OUTCOME_UNKNOWN", "请求结果未知，请先查询会话")
+            failure = error(request, 504, "REQUEST_OUTCOME_UNKNOWN", "请求结果未知，请先查询会话")
             db.execute("""UPDATE request_executions SET status = 'UNKNOWN', completed_at = ?,
                           response_status = 504, response_body = ? WHERE scope_type = 'SESSION_EVENT'
                           AND scope_id = ? AND client_request_id = ? AND status = 'RUNNING'
                           AND deadline_at <= ?""",
                        (now, failure.body.decode('utf-8'), session_id, client_event_id, now))
             return failure
-        return error(409, "REQUEST_IN_PROGRESS", "请求正在处理", retryable=True, headers={"Retry-After": "1"})
+        return error(request, 409, "REQUEST_IN_PROGRESS", "请求正在处理", retryable=True, headers={"Retry-After": "1"})
     if previous["status"] == "UNKNOWN":
-        return error(504, "REQUEST_OUTCOME_UNKNOWN", "请求结果未知，请先查询会话")
+        return error(request, 504, "REQUEST_OUTCOME_UNKNOWN", "请求结果未知，请先查询会话")
     return JSONResponse(status_code=200 if previous["status"] == "SUCCEEDED" else previous["response_status"],
                         content=json.loads(previous["response_body"]))
 
@@ -222,12 +222,12 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
                 return failure
             row = owned_session(db, session_id, owner)
             if not row:
-                return error(404, "RESOURCE_NOT_FOUND", "会话不可用")
-            replay = replay_session_event(db, session_id, payload.clientEventId, digest)
+                return error(request, 404, "RESOURCE_NOT_FOUND", "会话不可用")
+            replay = replay_session_event(db, request, session_id, payload.clientEventId, digest)
             if replay is not None:
                 return replay
             if row["revision"] != payload.expectedRevision:
-                return error(409, "SESSION_CONFLICT", "会话状态已变化")
+                return error(request, 409, "SESSION_CONFLICT", "会话状态已变化")
             if payload.eventType == "STARTED":
                 valid = row["status"] == "CREATED" and payload.pageNumber == row["start_page_number"]
             else:
@@ -235,7 +235,7 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
                                   (row["version_id"], row["current_page_no"])).fetchone()
                 valid = row["status"] == "IN_PROGRESS" and page and page[0] == payload.pageNumber
             if not valid:
-                return error(409, "SESSION_CONFLICT", "当前状态或页面不允许此操作")
+                return error(request, 409, "SESSION_CONFLICT", "当前状态或页面不允许此操作")
             now = int(time.time() * 1000)
             revision = row["revision"] + 1
             visited = json.loads(row["visited_pages_json"])
@@ -248,13 +248,13 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
                  result_status, revision_after, created_at) VALUES (?, ?, ?, ?, '{}', ?, ?, 'SUCCESS', ?, ?)""",
                 (session_id, row["version_id"], payload.clientEventId, digest, payload.pageNumber,
                  payload.eventType, revision, now))
-            response = {"data": {"interactionEventId": cursor.lastrowid, "revision": revision}, "requestId": str(uuid4())}
+            response = {"data": {"interactionEventId": cursor.lastrowid, "revision": revision}, "requestId": request.state.request_id}
             db.execute("UPDATE interaction_events SET response_json = ? WHERE id = ?",
                        (json.dumps(response, ensure_ascii=False), cursor.lastrowid))
             record_session_event(db, owner, session_id, payload.clientEventId, digest, now, 201, response)
             return JSONResponse(status_code=201, content=response)
     except sqlite3.Error:
-        return error(503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
+        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
 
 
 @router.post("/{session_id}/completions")
@@ -270,8 +270,8 @@ def finish_session(payload: Completion, request: Request, background: Background
                 return failure
             row = owned_session(db, session_id, owner)
             if not row:
-                return error(404, "RESOURCE_NOT_FOUND", "会话不可用")
-            replay = replay_session_event(db, session_id, payload.clientEventId, digest)
+                return error(request, 404, "RESOURCE_NOT_FOUND", "会话不可用")
+            replay = replay_session_event(db, request, session_id, payload.clientEventId, digest)
             if replay is not None:
                 return replay
             now = int(time.time() * 1000)
@@ -294,14 +294,14 @@ def finish_session(payload: Completion, request: Request, background: Background
                 generation = (facts, texts)
                 report = db.execute("SELECT * FROM reading_reports WHERE session_id = ?", (session_id,)).fetchone()
             else:
-                return error(409, "SESSION_CONFLICT", "阅读进度已更新，请刷新后再结束")
+                return error(request, 409, "SESSION_CONFLICT", "阅读进度已更新，请刷新后再结束")
             current = db.execute("SELECT *, NULL AS grant_expires_at FROM reading_sessions WHERE id = ?",
                                  (session_id,)).fetchone()
             response = {"data": {"session": session_object(current), "report": report_object(session_id, report)},
-                        "requestId": str(uuid4())}
+                        "requestId": request.state.request_id}
             record_session_event(db, owner, session_id, payload.clientEventId, digest, now, 200, response)
     except sqlite3.Error:
-        return error(503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
+        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
     if generation is not None:
         background.add_task(generate_report, session_id, *generation,
                             getattr(request.app.state, "model_adapter", None))
