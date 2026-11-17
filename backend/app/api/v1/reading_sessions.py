@@ -56,13 +56,13 @@ def session_object(row):
     }
 
 
-# Retired library versions remain readable only by an existing active session.
-# WITHDRAWN content is never readable, even through an existing session.
+# Retired versions remain readable for existing sessions (history, reports and replay),
+# while new session creation still rejects retired LIBRARY versions and WITHDRAWN blocks all access.
 SESSION_ACCESS = """(v.status = 'PUBLISHED' OR
     (v.status = 'APPROVED_PRIVATE' AND b.owner_guardian_id = ?) OR
     (v.status = 'RETIRED' AND v.reviewed_by_id IS NOT NULL AND v.reviewed_at IS NOT NULL
        AND ((b.source_type = 'ORIGINAL' AND b.owner_guardian_id = ?)
-         OR (b.source_type = 'LIBRARY' AND s.status IN ('CREATED', 'IN_PROGRESS')))))"""
+         OR b.source_type = 'LIBRARY')))"""
 
 
 @router.post("", status_code=201)
@@ -204,13 +204,21 @@ def replay_session_event(db, request: Request, session_id: int, client_event_id:
 
 
 def record_session_event(db, owner: int, session_id: int, client_event_id: str, digest: str,
-                         now: int, status_code: int, response: dict) -> None:
+                         now: int, status_code: int, response: dict, *, status: str = "SUCCEEDED") -> None:
     db.execute("""INSERT INTO request_executions
         (owner_account_id, session_id, scope_type, scope_id, client_request_id, request_digest,
          status, execution_token, started_at, deadline_at, completed_at, response_status, response_body)
-        VALUES (?, ?, 'SESSION_EVENT', ?, ?, ?, 'SUCCEEDED', ?, ?, ?, ?, ?, ?)""",
-        (owner, session_id, session_id, client_event_id, digest, str(uuid4()), now, now + 25000,
+        VALUES (?, ?, 'SESSION_EVENT', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (owner, session_id, session_id, client_event_id, digest, status, str(uuid4()), now, now + 25000,
          now, status_code, json.dumps(response, ensure_ascii=False)))
+
+
+def fail_session_event(db, request: Request, owner: int, session_id: int, client_event_id: str,
+                       digest: str, status_code: int, code: str, message: str):
+    failure = error(request, status_code, code, message)
+    record_session_event(db, owner, session_id, client_event_id, digest,
+                         int(time.time() * 1000), status_code, json.loads(failure.body), status="FAILED")
+    return failure
 
 
 @router.post("/{session_id}/events", status_code=201)
@@ -229,7 +237,8 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
             if replay is not None:
                 return replay
             if row["revision"] != payload.expectedRevision:
-                return error(request, 409, "SESSION_CONFLICT", "会话状态已变化")
+                return fail_session_event(db, request, owner, session_id, payload.clientEventId,
+                                          digest, 409, "SESSION_CONFLICT", "会话状态已变化")
             if payload.eventType == "STARTED":
                 valid = row["status"] == "CREATED" and payload.pageNumber == row["start_page_number"]
             else:
@@ -237,7 +246,8 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
                                   (row["version_id"], row["current_page_no"])).fetchone()
                 valid = row["status"] == "IN_PROGRESS" and page and page[0] == payload.pageNumber
             if not valid:
-                return error(request, 409, "SESSION_CONFLICT", "当前状态或页面不允许此操作")
+                return fail_session_event(db, request, owner, session_id, payload.clientEventId,
+                                          digest, 409, "SESSION_CONFLICT", "当前状态或页面不允许此操作")
             now = int(time.time() * 1000)
             revision = row["revision"] + 1
             visited = json.loads(row["visited_pages_json"])
@@ -296,7 +306,8 @@ def finish_session(payload: Completion, request: Request, background: Background
                 generation = (facts, texts)
                 report = db.execute("SELECT * FROM reading_reports WHERE session_id = ?", (session_id,)).fetchone()
             else:
-                return error(request, 409, "SESSION_CONFLICT", "阅读进度已更新，请刷新后再结束")
+                return fail_session_event(db, request, owner, session_id, payload.clientEventId,
+                                          digest, 409, "SESSION_CONFLICT", "阅读进度已更新，请刷新后再结束")
             current = db.execute("SELECT *, NULL AS grant_expires_at FROM reading_sessions WHERE id = ?",
                                  (session_id,)).fetchone()
             response = {"data": {"session": session_object(current), "report": report_object(session_id, report)},

@@ -3,16 +3,21 @@
 Rules follow common.reportLifecycle in docs/design/api-contract-v0.4.json:
 - the first finish stores a PENDING report holding the fact summary in the same transaction;
 - generation runs after commit and only moves a report that is still PENDING;
-- on startup, leftover PENDING reports become FAILED without calling the model.
+- on startup, leftover PENDING reports become FAILED without calling the model;
+- the service stays unready until startup recovery completes against the active database.
 """
 
 import json
 import logging
 import sqlite3
+import threading
 import time
 from contextlib import closing
+from pathlib import Path
 
 from app.api.v1.auth import connect
+from app.core.config import database_path
+from app.db.connection import database_ready
 
 logger = logging.getLogger("zhiya.reports")
 MAX_SUMMARY_CHARS = 500
@@ -20,6 +25,8 @@ SUMMARY_PROMPT = (
     "你是儿童绘本共读助手。请根据给出的阅读事实和已读页面正文，为家长写一段不超过120字的中文共读小结。"
     "只陈述已发生的阅读事实和可在家延续的温和建议，不评价孩子能力，不编造未出现的互动。"
 )
+_recovery_lock = threading.Lock()
+_recovered_paths: set[Path] = set()
 
 
 def fact_summary(visited_pages: list[int]) -> str:
@@ -80,15 +87,34 @@ async def generate_report(session_id: int, facts: str, page_texts: list[str], ad
         logger.warning("report_settle_failed session_id=%s", session_id)
 
 
-def recover_pending_reports() -> int:
-    """Single-worker startup recovery, before the app is ready. Does not call the model."""
-    try:
-        with closing(connect()) as db, db:
-            cursor = db.execute(
-                """UPDATE reading_reports SET status = 'FAILED', activities_json = '[]', updated_at = ?
-                   WHERE status = 'PENDING'""",
-                (int(time.time() * 1000),))
-            return cursor.rowcount
-    except sqlite3.Error:
-        logger.warning("report_recovery_skipped database_unavailable")
-        return 0
+def reset_recovery_state() -> None:
+    with _recovery_lock:
+        _recovered_paths.clear()
+
+
+def ensure_startup_recovered() -> bool:
+    """Run startup PENDING->FAILED recovery once per startup on the active DB; never calls the model."""
+    target = database_path().resolve()
+    with _recovery_lock:
+        if target in _recovered_paths:
+            return True
+        if not database_ready(target):
+            return False
+        try:
+            with closing(connect(timeout=0.3)) as db, db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute(
+                    """UPDATE reading_reports SET status = 'FAILED', activities_json = '[]', updated_at = ?
+                       WHERE status = 'PENDING'""",
+                    (int(time.time() * 1000),))
+        except sqlite3.Error:
+            logger.warning("report_recovery_failed database_unavailable")
+            return False
+        _recovered_paths.add(target)
+        return True
+
+
+def recover_pending_reports() -> bool:
+    """Single-worker startup recovery called by lifespan before readiness."""
+    reset_recovery_state()
+    return ensure_startup_recovered()

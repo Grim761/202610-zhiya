@@ -176,7 +176,7 @@ def test_reading_event_transitions_and_idempotency(bookshelf):
     assert conflict.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
     assert conflict.json()["requestId"] == conflict.headers["X-Request-ID"]
     change = {"eventType": "PAGE_CHANGED", "pageNumber": 2, "expectedRevision": 1, "clientEventId": "page"}
-    assert first.post(url, headers=headers, json={**change, "pageNumber": 5}).status_code == 409
+    assert first.post(url, headers=headers, json={**change, "pageNumber": 5, "clientEventId": "bad-page"}).status_code == 409
     assert first.post(url, headers=headers, json=change).status_code == 201
     assert first.post(url, headers=headers, json={**change, "clientEventId": "stale"}).status_code == 409
     data = first.get(f"/api/v1/reading-sessions/{session}").json()["data"]
@@ -418,3 +418,114 @@ def test_concurrent_finish_and_page_change_commit_once(bookshelf):
     assert codes in ([200, 409], [201, 409])
     with closing(sqlite3.connect(path)) as db:
         assert db.execute("SELECT revision FROM reading_sessions WHERE id = ?", (race,)).fetchone()[0] == 2
+
+
+def test_failed_event_and_completion_conflicts_are_recorded_and_replayed(bookshelf):
+    first, _, path = bookshelf
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    session = _started_session(first, headers, path)
+    events = f"/api/v1/reading-sessions/{session}/events"
+    completions = f"/api/v1/reading-sessions/{session}/completions"
+    early_page = {"eventType": "PAGE_CHANGED", "pageNumber": 2, "expectedRevision": 1, "clientEventId": "early-page"}
+    early_end = {"reason": "USER_FINISH", "expectedRevision": 1, "clientEventId": "early-end"}
+
+    err1 = first.post(events, headers=headers, json=early_page)
+    assert err1.status_code == 409 and err1.json()["error"]["code"] == "SESSION_CONFLICT"
+    err2 = first.post(completions, headers=headers, json=early_end)
+    assert err2.status_code == 409 and err2.json()["error"]["code"] == "SESSION_CONFLICT"
+
+    # Now advance session to IN_PROGRESS / revision=1 where those payloads would otherwise match.
+    assert first.post(events, headers=headers, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start"
+    }).status_code == 201
+
+    replay_page = first.post(events, headers=headers, json=early_page)
+    assert replay_page.status_code == 409 and replay_page.json()["error"] == err1.json()["error"]
+    assert replay_page.json()["requestId"] == replay_page.headers["X-Request-ID"] != err1.json()["requestId"]
+    assert first.post(events, headers=headers, json={**early_page, "expectedRevision": 0}).json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+    replay_end = first.post(completions, headers=headers, json=early_end)
+    assert replay_end.status_code == 409 and replay_end.json()["error"] == err2.json()["error"]
+    assert replay_end.json()["requestId"] == replay_end.headers["X-Request-ID"] != err2.json()["requestId"]
+
+    view = first.get(f"/api/v1/reading-sessions/{session}").json()["data"]["session"]
+    assert view["status"] == "IN_PROGRESS" and view["currentPage"] == 1 and view["revision"] == 1
+    with closing(sqlite3.connect(path)) as db:
+        statuses = dict(db.execute(
+            "SELECT client_request_id, status FROM request_executions WHERE session_id = ?", (session,)
+        ).fetchall())
+        assert statuses == {"early-page": "FAILED", "early-end": "FAILED", "start": "SUCCEEDED"}
+
+
+def test_retired_library_version_allows_active_content_and_finished_history_replay(bookshelf):
+    first, _, path = bookshelf
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    session = _started_session(first, headers, path)
+    events = f"/api/v1/reading-sessions/{session}/events"
+    completions = f"/api/v1/reading-sessions/{session}/completions"
+    assert first.post(events, headers=headers, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start"
+    }).status_code == 201
+
+    # Retire the public LIBRARY version while this session is IN_PROGRESS.
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("UPDATE story_versions SET status = 'RETIRED', reviewed_by_id = 1, reviewed_at = 1 WHERE id = 11")
+
+    profile_id = first.get("/api/v1/child-profiles").json()["data"]["items"][0]["childProfileId"]
+    assert first.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile_id, "storyVersionId": 11, "mode": "PARENT_CHILD"
+    }).status_code == 404
+    assert 11 not in [item["storyVersionId"] for item in first.get("/api/v1/storybooks").json()["data"]["items"]]
+    assert 11 not in [item["storyVersionId"] for item in first.get("/api/v1/storybooks", params={"scope": "mine"}).json()["data"]["items"]]
+    assert first.get("/api/v1/story-versions/11").status_code == 200  # active session can still read story pages
+    assert first.post(events, headers=headers, json={
+        "eventType": "PAGE_CHANGED", "pageNumber": 2, "expectedRevision": 1, "clientEventId": "page2"
+    }).status_code == 201
+
+    finish = {"reason": "USER_FINISH", "expectedRevision": 2, "clientEventId": "end"}
+    done = first.post(completions, headers=headers, json=finish)
+    assert done.status_code == 200 and done.json()["data"]["session"]["status"] == "FINISHED"
+
+    # Once finished: version detail is closed, but session history, report and completion replay stay accessible.
+    assert first.get("/api/v1/story-versions/11").status_code == 404
+    assert first.get(f"/api/v1/reading-sessions/{session}").json()["data"]["report"]["readingSessionId"] == session
+    assert [s["readingSessionId"] for s in first.get("/api/v1/reading-sessions").json()["data"]["items"]] == [session]
+    assert first.post(completions, headers=headers, json=finish).status_code == 200
+    assert first.post(completions, headers=headers, json={**finish, "clientEventId": "end-2"}).status_code == 200
+
+    # Withdrawing immediately blocks content, history, and replay.
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("UPDATE story_versions SET status = 'WITHDRAWN' WHERE id = 11")
+    assert first.get("/api/v1/story-versions/11").status_code == 404
+    assert first.get(f"/api/v1/reading-sessions/{session}").status_code == 404
+    assert first.post(completions, headers=headers, json=finish).status_code == 404
+
+
+def test_startup_recovery_stays_unready_while_locked_and_recovers_after_release(bookshelf):
+    first, _, path = bookshelf
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    pending = _started_session(first, headers, path, pages=1)
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("INSERT INTO reading_reports VALUES (?, 'PENDING', '事实摘要', '[]', 1)", (pending,))
+
+    # Hold a write lock during app startup so lifespan recovery cannot commit.
+    locker = sqlite3.connect(path)
+    try:
+        locker.execute("BEGIN IMMEDIATE")
+        with TestClient(app, base_url="https://testserver") as locked_client:
+            unready = locked_client.get("/api/v1/health")
+            assert unready.status_code == 503 and unready.json()["error"]["retryable"] is True
+            with closing(sqlite3.connect(path)) as reader:
+                assert reader.execute(
+                    "SELECT status FROM reading_reports WHERE session_id = ?", (pending,)
+                ).fetchone()[0] == "PENDING"
+            locker.rollback()
+            ready = locked_client.get("/api/v1/health")
+            assert ready.status_code == 200 and ready.json()["data"]["status"] == "ok"
+    finally:
+        locker.close()
+
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute(
+            "SELECT status, summary, activities_json FROM reading_reports WHERE session_id = ?", (pending,)
+        ).fetchone() == ("FAILED", "事实摘要", "[]")
