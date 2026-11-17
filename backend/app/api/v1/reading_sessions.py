@@ -275,7 +275,7 @@ def finish_session(payload: Completion, request: Request, background: Background
     """API-019 USER_FINISH (DCL-006 candidate rules). Report generation runs after commit."""
     # Recovery has its own write transaction and must finish before any new PENDING report exists.
     if not ensure_startup_recovered():
-        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "阅读小结服务暂不可用", retryable=True)
+        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "阅读小结服务暂不可用")
     digest = request_digest(f"/api/v1/reading-sessions/{session_id}/completions", payload.model_dump())
     try:
         with closing(connect()) as db, db:

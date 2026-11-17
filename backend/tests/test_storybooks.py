@@ -563,7 +563,7 @@ def test_delayed_recovery_preserves_a_new_report_during_generation(bookshelf, mo
             monkeypatch.setattr(app.state, "model_adapter", PausedAdapter())
             assert client.get("/api/v1/health").status_code == 503
             unavailable = client.post(f"{url}/completions", headers=headers, json=finish)
-            assert unavailable.status_code == 503 and unavailable.json()["error"]["retryable"] is True
+            assert unavailable.status_code == 503 and unavailable.json()["error"]["retryable"] is False
             assert client.get(url).json()["data"]["session"]["status"] == "IN_PROGRESS"
             assert not model_started.is_set()
             locker.rollback()
