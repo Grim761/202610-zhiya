@@ -1,16 +1,31 @@
 """Read-only guardian bookshelf; child grants and media delivery are future work."""
 
+import json
 import sqlite3
 from contextlib import closing
 from typing import Literal
 
 from fastapi import APIRouter, Path, Query, Request
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.api.v1.auth import authenticate_request, connect, error
+from app.api.v1.profiles import guardian
 
 router = APIRouter(prefix="/api/v1")
+MAX_ID = 9007199254740991
 AgeBand = Literal["AGE_3_4", "AGE_4_5", "AGE_5_6"]
 AGES = {"AGE_3_4": (3, 4), "AGE_4_5": (4, 5), "AGE_5_6": (5, 6)}
+AGE_LABELS = {"AGE_3_4": "3～4 岁", "AGE_4_5": "4～5 岁", "AGE_5_6": "5～6 岁"}
+
+
+def page_object(page_row) -> dict:
+    return {
+        "pageNumber": page_row["page_no"],
+        "text": page_row["body_text"],
+        # No verified, version-bound media resolver exists yet. Never expose seed paths.
+        "imageRef": None,
+        "defaultNextPageNumber": page_row["default_next_page_number"],
+    }
 
 
 def version_object(db, row):
@@ -24,14 +39,24 @@ def version_object(db, row):
     return {
         "storybookId": row["storybook_id"], "storyVersionId": row["id"],
         "versionNumber": row["version_no"], "title": row["title"], "status": row["status"],
-        # No verified, version-bound media resolver exists yet. Never expose seed paths.
         "coverRef": None,
-        "pages": [{"pageNumber": p["page_no"], "text": p["body_text"], "imageRef": None,
-                   "defaultNextPageNumber": p["default_next_page_number"]} for p in pages],
+        "pages": [page_object(p) for p in pages],
         "branches": [{"branchId": b["id"], "fromPageNumber": b["from_page_no"],
                       "nextPageNumber": b["next_page_no"], "choiceLabel": b["choice_label"],
                       "reviewStatus": b["review_status"]} for b in branches],
     }
+
+
+class RecommendationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    childProfileId: int = Field(ge=1, le=MAX_ID, strict=True)
+    topic: str | None = Field(default=None, min_length=1, max_length=100)
+    minutes: int | None = Field(default=None, ge=1, le=30, strict=True)
+
+    @field_validator("topic", mode="before")
+    @classmethod
+    def clean_topic(cls, value):
+        return value.strip() if isinstance(value, str) else value
 
 
 # PUBLISHED is public to authenticated guardians; private versions require ownership.
@@ -118,3 +143,56 @@ def get_story_version(request: Request, version_id: int = Path(ge=1, le=90071992
             return {"data": version_object(db, row), "requestId": request.state.request_id}
     except sqlite3.Error:
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
+
+
+@router.post("/recommendations")
+def recommend_storybooks(payload: RecommendationRequest, request: Request):
+    """API-010: age-band and topic recommendations across accessible current PUBLISHED/APPROVED_PRIVATE versions."""
+    try:
+        with closing(connect()) as db:
+            db.execute("BEGIN")
+            owner, failure = guardian(db, request, write=True)
+            if failure:
+                return failure
+            profile = db.execute(
+                "SELECT id, age_band, interests_json FROM child_profiles WHERE id = ? AND guardian_id = ?",
+                (payload.childProfileId, owner),
+            ).fetchone()
+            if not profile:
+                return error(request, 404, "RESOURCE_NOT_FOUND", "儿童档案不可用")
+            low, high = AGES[profile["age_band"]]
+            conditions = [
+                VISIBLE,
+                "v.age_min <= ? AND v.age_max >= ?",
+                "EXISTS (SELECT 1 FROM story_pages p WHERE p.version_id = v.id AND p.page_no = 1)",
+            ]
+            params: list[object] = [owner, False, owner, high, low]
+            if payload.topic is not None:
+                conditions.append("EXISTS (SELECT 1 FROM json_each(v.topics_json) WHERE value = ?)")
+                params.append(payload.topic)
+            rows = db.execute(
+                "SELECT v.* FROM story_versions v JOIN storybooks b ON b.id = v.storybook_id WHERE "
+                + " AND ".join(conditions)
+                + " ORDER BY v.storybook_id, v.version_no DESC LIMIT 50",
+                params,
+            ).fetchall()
+            interests = set(json.loads(profile["interests_json"]))
+            scored = []
+            for row in rows:
+                topics = json.loads(row["topics_json"])
+                matched = [t for t in topics if t in interests]
+                scored.append((0 if matched else 1, row["storybook_id"], row, matched))
+            scored.sort(key=lambda item: (item[0], item[1]))
+            age_label = AGE_LABELS[profile["age_band"]]
+            items = []
+            for _, _, row, matched in scored[:10]:
+                if payload.topic is not None:
+                    reason = f"符合 {age_label} 与主题「{payload.topic}」"
+                elif matched:
+                    reason = f"符合 {age_label} 与兴趣「{matched[0]}」"
+                else:
+                    reason = f"适合 {age_label} 共读"
+                items.append({"storyVersionId": row["id"], "reason": reason, "sources": []})
+            return {"data": {"items": items}, "requestId": request.state.request_id}
+    except sqlite3.Error:
+        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
