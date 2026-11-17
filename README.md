@@ -10,7 +10,7 @@
 
 ## 项目定位
 
-以可独立公网使用的响应式Web软件为主体，以幼儿早期阅读领域智能体为技术重点。AI辅助家长选择绘本、开展互动和获得阅读反馈，不替代亲子陪伴。当前工作范围仅包含软件，暂不安排硬件开发。
+以可独立公网使用的响应式Web软件为主体，以幼儿早期阅读领域智能体为技术重点。AI辅助家长选择绘本、开展互动和获得阅读反馈，不替代亲子陪伴。可选硬件扩展采用 Waveshare ESP32-S3-Touch-LCD-4.3C（SKU 33799，无外壳版），作为独立样机开发与验收，软件核心流程可独立运行。
 
 ## 规划功能
 
@@ -56,7 +56,7 @@ npm ci
 npm run dev
 ```
 
-页面默认在 http://127.0.0.1:5173，通过 Vite 代理读取 API-032 的真实就绪状态。当前分支新增录音转换和语音接口，业务认证尚待接入，默认拒绝语音请求；其他业务接口与页面功能待后续开发。数据库默认位于 `database/instance/zhiya.sqlite3`，可在运行命令前设置环境变量 `ZHIYA_DB_PATH`。导入只在空种子表写入，已存在全部种子键时跳过，种子键缺失且表非空时退出。绘本版本和知识初始状态为 `DRAFT`。
+页面默认在 http://127.0.0.1:5173，通过 Vite 代理读取 API-032 的真实就绪状态。截至 2026-11-17，后端已提供家长注册/登录/退出、档案创建与修改、绘本读取、共读会话创建与查询、开始/翻页/结束、阅读小结及语音/音频接口。语音复用真实家长 Cookie/CSRF 认证；带凭据的浏览器联调需要 HTTPS，因为认证 Cookie 带有 Secure 属性。儿童模式认证、问答与引导、内容管理和完整前后端流程仍待协作，详见[后端说明](backend/README.md)。数据库默认位于 `database/instance/zhiya.sqlite3`，可在运行命令前设置环境变量 `ZHIYA_DB_PATH`。导入只在空种子表写入，已存在全部种子键时跳过，种子键缺失且表非空时退出。绘本版本和知识初始状态为 `DRAFT`，导入不等于已审核可读。
 
 在根目录检查数据库及运行测试：
 
@@ -77,9 +77,9 @@ npm --prefix frontend run build
 - [G08 声线与模型合成语速交接](docs/design/speech-preferences-handoff.md)
 - [声线语速实测与最新容器检查](docs/testing/speech-preferences-checks.md)
 - [六声线试听与独立交付验证](docs/testing/g08-live-delivery-checks.md)
-- [知芽软件工程团队项目选题报告](docs/知芽-软件工程团队项目选题报告.docx)
-- [软件需求规格说明书 v0.2（待团队评审）](docs/requirements/软件需求规格说明书.md)
-- [项目设计与开发规范 v1.1（修订评审稿）](docs/standards/知芽_项目设计与开发规范_精简版_v1.1.md)
+- [知芽软件工程团队项目选题报告（立项版本）](docs/知芽-软件工程团队项目选题报告.docx)
+- [软件需求规格说明书 v0.3（待团队评审）](docs/requirements/软件需求规格说明书.md)
+- [项目设计与开发规范 v1.2（修订评审稿）](docs/standards/知芽_项目设计与开发规范_精简版_v1.2.md)
 - [公共术语与枚举](docs/standards/glossary.md)
 - [设计变更与冲突决策记录](docs/standards/design-change-log.md)
 - [系统与数据库设计 v1.1](docs/design/team-lead-handoff-v1.1.md)
@@ -87,8 +87,9 @@ npm --prefix frontend run build
 - [种子数据与导入说明](data/seed/README.md)
 - [知识库资源交付 v2.5](knowledge-base_v2.5/资源交付说明_v2.5.md)
 - [交互原型入口](prototype/README.md)
+- [4.3C 硬件工程与验收说明](hardware/README.md)
 
-选题报告与需求说明书保留原始内容；需求说明书v0.2仍为待团队评审草案。其中新增的儿童自主阅读、原创绘本和故事分支等属于拟议需求，不代表已经确认或实现。功能范围、优先级及验收指标以团队评审形成的需求基线为准。
+选题报告保留立项方案。需求说明书 v0.3 记录当前 4.3C 硬件方案，仍待团队评审。功能范围、优先级及验收指标以团队评审形成的需求基线为准。
 
 ## 主要目录
 
@@ -99,6 +100,7 @@ npm --prefix frontend run build
 │   ├── requirements/     # 需求说明、图源与图片
 │   └── design/           # 设计说明、接口契约与 UML 图源
 ├── data/seed/            # 种子数据与导入说明
+├── hardware/             # 4.3C 可选硬件工程与上板说明
 ├── knowledge-base_v2.5/  # 绘本、知识条目与封面
 └── prototype/            # 原型入口与静态后台源码
 ```
