@@ -3,17 +3,23 @@
 import asyncio
 import json
 import re
+import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
 from pydantic import ValidationError
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException
 
+from app.api.v1.auth import authenticate_request, connect
+from app.api.v1.storybooks import accessible_story_version
 from app.audio_conversion import MAX_UPLOAD_BYTES, normalize_recording
 from app.errors import ServiceError
 from app.schemas.voice import PageVoiceRequest, SynthesisRequest
+from app.services.story_media import MediaDependencyError, parse_asset_key, resolve_cover_asset, resolve_page_asset
 from app.services.voice_access import VoicePrincipal, read_voice_source, recheck_source
 
 router = APIRouter(prefix="/api/v1")
@@ -150,9 +156,58 @@ async def synthesize(request: Request):
             "requestId": request.state.request_id}
 
 
+def _unavailable_read() -> ServiceError:
+    exc = ServiceError("DEPENDENCY_UNAVAILABLE", "服务暂不可用", 503)
+    exc.retryable = True
+    return exc
+
+
+def _read_story_image(request: Request, version_id: int, page_no: int | None) -> tuple[bytes, str]:
+    try:
+        with closing(connect()) as db:
+            db.execute("BEGIN")
+            principal, failure = authenticate_request(db, request, write=False)
+            if failure is not None:
+                body = json.loads(failure.body)["error"]
+                raise ServiceError(body["code"], body["message"], failure.status_code)
+            version = accessible_story_version(db, principal, version_id)
+            if not version:
+                raise ServiceError("RESOURCE_NOT_FOUND", "请求的资源不存在", 404)
+            if page_no is None:
+                resolved = resolve_cover_asset(version["storybook_id"], version["storybook_source_type"],
+                                               version["source_ref"])
+            else:
+                page = db.execute(
+                    "SELECT image_ref FROM story_pages WHERE version_id = ? AND page_no = ?",
+                    (version_id, page_no),
+                ).fetchone()
+                resolved = resolve_page_asset(page["image_ref"]) if page else None
+            if resolved is None:
+                raise ServiceError("RESOURCE_NOT_FOUND", "请求的资源不存在", 404)
+            path, media_type = resolved
+            try:
+                return path.read_bytes(), media_type
+            except FileNotFoundError:
+                raise ServiceError("RESOURCE_NOT_FOUND", "请求的资源不存在", 404) from None
+            except OSError as exc:
+                raise _unavailable_read() from exc
+    except (sqlite3.Error, MediaDependencyError):
+        raise _unavailable_read() from None
+
+
 @router.get("/media/{resource_key}", response_class=Response,
-            responses={200: {"content": {"audio/wav": {"schema": {"type": "string", "format": "binary"}}}}})
+            responses={200: {"content": {"audio/wav": {"schema": {"type": "string", "format": "binary"}},
+                                         "image/png": {"schema": {"type": "string", "format": "binary"}},
+                                         "image/jpeg": {"schema": {"type": "string", "format": "binary"}},
+                                         "image/webp": {"schema": {"type": "string", "format": "binary"}}}}})
 async def media(request: Request, resource_key: str):
+    asset_target = parse_asset_key(resource_key)
+    if asset_target is not None:
+        data, media_type = await run_in_threadpool(_read_story_image, request, *asset_target)
+        return Response(data, media_type=media_type, headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        })
     try:
         principal = await authenticate(request, write=False)
         store = request.app.state.voice_media

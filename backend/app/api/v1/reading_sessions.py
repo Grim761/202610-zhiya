@@ -26,6 +26,7 @@ from app.api.v1.profiles import guardian, guardian_session
 from app.api.v1.storybooks import VISIBLE, page_object
 from app.services.cleanup import delete_session_rows, purge_voice_media
 from app.services.reading_reports import ensure_startup_recovered, fact_summary, generate_report, report_object
+from app.services.story_media import MediaDependencyError
 
 router = APIRouter(prefix="/api/v1/reading-sessions")
 MAX_ID = 9007199254740991
@@ -463,7 +464,7 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
                        (json.dumps(response, ensure_ascii=False), cursor.lastrowid))
             record_session_event(db, principal.guardian_id, session_id, payload.clientEventId, digest, now, 201, response)
             return JSONResponse(status_code=201, content=response)
-    except sqlite3.Error:
+    except (sqlite3.Error, MediaDependencyError):
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
 
 
@@ -534,7 +535,7 @@ def choose_branch(payload: BranchChoice, request: Request, session_id: int = Pat
                        (json.dumps(response, ensure_ascii=False), cursor.lastrowid))
             record_session_event(db, principal.guardian_id, session_id, payload.clientEventId, digest, now, 201, response)
             return JSONResponse(status_code=201, content=response)
-    except sqlite3.Error:
+    except (sqlite3.Error, MediaDependencyError):
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
 
 

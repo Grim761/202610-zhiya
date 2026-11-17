@@ -8,8 +8,9 @@ from typing import Literal
 from fastapi import APIRouter, Path, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.api.v1.auth import authenticate_request, connect, error
+from app.api.v1.auth import Principal, authenticate_request, connect, error
 from app.api.v1.profiles import guardian
+from app.services.story_media import MediaDependencyError, cover_ref_for, page_image_ref_for
 
 router = APIRouter(prefix="/api/v1")
 MAX_ID = 9007199254740991
@@ -22,8 +23,7 @@ def page_object(page_row) -> dict:
     return {
         "pageNumber": page_row["page_no"],
         "text": page_row["body_text"],
-        # No verified, version-bound media resolver exists yet. Never expose seed paths.
-        "imageRef": None,
+        "imageRef": page_image_ref_for(page_row["version_id"], page_row["page_no"], page_row["image_ref"]),
         "defaultNextPageNumber": page_row["default_next_page_number"],
     }
 
@@ -36,10 +36,13 @@ def version_object(db, row):
         "SELECT * FROM story_branches WHERE version_id = ? AND review_status = 'APPROVED' ORDER BY id",
         (row["id"],),
     ).fetchall()
+    source_type = row["storybook_source_type"] if "storybook_source_type" in row.keys() else (
+        db.execute("SELECT source_type FROM storybooks WHERE id = ?", (row["storybook_id"],)).fetchone()["source_type"]
+    )
     return {
         "storybookId": row["storybook_id"], "storyVersionId": row["id"],
         "versionNumber": row["version_no"], "title": row["title"], "status": row["status"],
-        "coverRef": None,
+        "coverRef": cover_ref_for(row["storybook_id"], row["id"], source_type, row["source_ref"]),
         "pages": [page_object(p) for p in pages],
         "branches": [{"branchId": b["id"], "fromPageNumber": b["from_page_no"],
                       "nextPageNumber": b["next_page_no"], "choiceLabel": b["choice_label"],
@@ -65,6 +68,35 @@ VISIBLE = """(v.status = 'PUBLISHED' OR
     (v.status = 'APPROVED_PRIVATE' AND b.owner_guardian_id = ?) OR
     (? AND v.status = 'RETIRED' AND b.source_type = 'ORIGINAL'
        AND b.owner_guardian_id = ? AND v.reviewed_by_id IS NOT NULL AND v.reviewed_at IS NOT NULL))"""
+
+
+def accessible_story_version(db, principal: Principal, version_id: int):
+    """Fetch a story_version if accessible to principal under common.versionAccess."""
+    grant_filter = (
+        "AND EXISTS (SELECT 1 FROM child_grant_books gb WHERE gb.grant_id = ? AND gb.version_id = v.id) "
+        if principal.role == "CHILD" else ""
+    )
+    active_session_filter = (
+        "EXISTS (SELECT 1 FROM reading_sessions s WHERE s.version_id = v.id AND s.grant_id = ? "
+        "AND s.profile_id = ? AND s.status IN ('CREATED', 'IN_PROGRESS'))"
+        if principal.role == "CHILD"
+        else "EXISTS (SELECT 1 FROM reading_sessions s JOIN child_profiles p ON p.id = s.profile_id "
+             "WHERE s.version_id = v.id AND p.guardian_id = ? AND s.status IN ('CREATED', 'IN_PROGRESS'))"
+    )
+    params = (
+        (version_id, principal.grant_id, principal.guardian_id, True, principal.guardian_id,
+         principal.grant_id, principal.profile_id)
+        if principal.role == "CHILD"
+        else (version_id, principal.guardian_id, True, principal.guardian_id, principal.guardian_id)
+    )
+    return db.execute(
+        "SELECT v.*, b.source_type AS storybook_source_type FROM story_versions v "
+        "JOIN storybooks b ON b.id = v.storybook_id "
+        f"WHERE v.id = ? {grant_filter}AND (" + VISIBLE +
+        " OR (v.status = 'RETIRED' AND v.reviewed_by_id IS NOT NULL AND v.reviewed_at IS NOT NULL "
+        f"AND b.source_type = 'LIBRARY' AND {active_session_filter}))",
+        params,
+    ).fetchone()
 
 
 @router.get("/storybooks")
@@ -96,13 +128,14 @@ def list_storybooks(request: Request, age_band: AgeBand | None = Query(default=N
             # Avoid exceeding SQLite's signed 64-bit integer range for very large pages.
             offset = min((page - 1) * page_size, 9223372036854775807)
             rows = db.execute(
-                "SELECT v.* FROM story_versions v JOIN storybooks b ON b.id = v.storybook_id WHERE "
+                "SELECT v.*, b.source_type AS storybook_source_type FROM story_versions v "
+                "JOIN storybooks b ON b.id = v.storybook_id WHERE "
                 + " AND ".join(conditions) + " ORDER BY v.storybook_id, v.version_no DESC LIMIT ? OFFSET ?",
                 (*params, page_size, offset),
             ).fetchall()
             items = [version_object(db, row) for row in rows]
             return {"data": {"items": items, "page": page, "pageSize": page_size}, "requestId": request.state.request_id}
-    except sqlite3.Error:
+    except (sqlite3.Error, MediaDependencyError):
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
 
 
@@ -114,34 +147,11 @@ def get_story_version(request: Request, version_id: int = Path(ge=1, le=90071992
             principal, failure = authenticate_request(db, request, write=False)
             if failure:
                 return failure
-            grant_filter = (
-                "AND EXISTS (SELECT 1 FROM child_grant_books gb WHERE gb.grant_id = ? AND gb.version_id = v.id) "
-                if principal.role == "CHILD" else ""
-            )
-            active_session_filter = (
-                "EXISTS (SELECT 1 FROM reading_sessions s WHERE s.version_id = v.id AND s.grant_id = ? "
-                "AND s.profile_id = ? AND s.status IN ('CREATED', 'IN_PROGRESS'))"
-                if principal.role == "CHILD"
-                else "EXISTS (SELECT 1 FROM reading_sessions s JOIN child_profiles p ON p.id = s.profile_id "
-                     "WHERE s.version_id = v.id AND p.guardian_id = ? AND s.status IN ('CREATED', 'IN_PROGRESS'))"
-            )
-            params = (
-                (version_id, principal.grant_id, principal.guardian_id, True, principal.guardian_id,
-                 principal.grant_id, principal.profile_id)
-                if principal.role == "CHILD"
-                else (version_id, principal.guardian_id, True, principal.guardian_id, principal.guardian_id)
-            )
-            row = db.execute(
-                "SELECT v.* FROM story_versions v JOIN storybooks b ON b.id = v.storybook_id "
-                f"WHERE v.id = ? {grant_filter}AND (" + VISIBLE +
-                " OR (v.status = 'RETIRED' AND v.reviewed_by_id IS NOT NULL AND v.reviewed_at IS NOT NULL "
-                f"AND b.source_type = 'LIBRARY' AND {active_session_filter}))",
-                params,
-            ).fetchone()
+            row = accessible_story_version(db, principal, version_id)
             if not row:
                 return error(request, 404, "RESOURCE_NOT_FOUND", "绘本不可用")
             return {"data": version_object(db, row), "requestId": request.state.request_id}
-    except sqlite3.Error:
+    except (sqlite3.Error, MediaDependencyError):
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
 
 
