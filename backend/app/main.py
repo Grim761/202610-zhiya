@@ -26,6 +26,7 @@ from app.voice_gateway import VoiceGateway
 from app.services.voice_access import VoiceAuthenticator
 from app.services.voice_auth import GuardianVoiceAuthenticator
 from app.services.voice_media import VoiceMediaStore
+from app.services.reading_reports import recover_pending_reports
 
 logger = logging.getLogger("zhiya.http")
 
@@ -41,6 +42,8 @@ def create_app(settings: Settings | None = None, speech_settings: SpeechSettings
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Single-worker first release: settle leftover PENDING reports before serving requests.
+        recover_pending_reports()
         async with ModelGateway(config) as gateway, VoiceGateway(speech_config) as voice_gateway:
             app.state.model_gateway = gateway
             app.state.model_adapter = ModelAdapter(gateway)

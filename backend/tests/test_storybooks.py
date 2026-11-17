@@ -235,3 +235,168 @@ def test_concurrent_event_retries_commit_once(bookshelf):
         assert db.execute("SELECT COUNT(*) FROM interaction_events WHERE session_id = ?", (session,)).fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM request_executions WHERE session_id = ?", (session,)).fetchone()[0] == 1
         assert db.execute("SELECT revision FROM reading_sessions WHERE id = ?", (session,)).fetchone()[0] == 1
+
+
+def _started_session(client, headers, path, pages=2):
+    with closing(sqlite3.connect(path)) as db, db:
+        for page in range(2, pages + 1):
+            db.execute("INSERT INTO story_pages (version_id, page_no, body_text, image_ref) VALUES (11, ?, ?, 'none')",
+                       (page, f"text-11-{page}"))
+            db.execute("UPDATE story_pages SET default_next_page_number = ? WHERE version_id = 11 AND page_no = ?",
+                       (page, page - 1))
+    profile = client.post("/api/v1/child-profiles", headers=headers,
+                          json={"ageBand": "AGE_3_4", "preferredMinutes": 10}).json()["data"]
+    session = client.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile["childProfileId"], "storyVersionId": 11, "mode": "PARENT_CHILD"
+    }).json()["data"]["readingSessionId"]
+    return session
+
+
+def test_finish_reading_lifecycle_replay_and_conflicts(bookshelf):
+    first, second, path = bookshelf
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    other = {"X-CSRF-Token": second.cookies["zhiya_csrf"]}
+    session = _started_session(first, headers, path)
+    events = f"/api/v1/reading-sessions/{session}/events"
+    url = f"/api/v1/reading-sessions/{session}/completions"
+    finish = {"reason": "USER_FINISH", "expectedRevision": 0, "clientEventId": "end"}
+    # CREATED sessions cannot be finished by the user.
+    created = first.post(url, headers=headers, json={**finish, "clientEventId": "early"})
+    assert created.status_code == 409 and created.json()["error"]["code"] == "SESSION_CONFLICT"
+    assert first.post(events, headers=headers, json={"eventType": "STARTED", "pageNumber": 1,
+                                                     "expectedRevision": 0, "clientEventId": "start"}).status_code == 201
+    assert first.post(events, headers=headers, json={"eventType": "PAGE_CHANGED", "pageNumber": 2,
+                                                     "expectedRevision": 1, "clientEventId": "page"}).status_code == 201
+    assert first.post(url, json={**finish, "expectedRevision": 2}).status_code == 403
+    assert second.post(url, headers=other, json={**finish, "expectedRevision": 2}).status_code == 404
+    assert first.post(url, headers=headers, json={**finish, "reason": "TIME_LIMIT"}).status_code == 422
+    assert first.post(url, headers=headers, json={**finish, "reason": "CONTINUED"}).status_code == 422
+    # The SESSION_EVENT key space is shared with reading events.
+    shared = first.post(url, headers=headers, json={**finish, "expectedRevision": 2, "clientEventId": "page"})
+    assert shared.status_code == 409 and shared.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    stale = first.post(url, headers=headers, json={**finish, "expectedRevision": 1})
+    assert stale.status_code == 409 and stale.json()["error"]["code"] == "SESSION_CONFLICT"
+
+    done = first.post(url, headers=headers, json={**finish, "clientEventId": "end-2", "expectedRevision": 2})
+    assert done.status_code == 200
+    data = done.json()["data"]
+    assert data["session"]["status"] == "FINISHED" and data["session"]["revision"] == 3
+    assert data["session"]["visitedPageNumbers"] == [1, 2]
+    assert data["report"] == {"readingSessionId": session, "summary": "本次共读阅读了第 1、2 页。",
+                              "activities": [], "status": "PENDING"}
+    # Without a configured model the post-commit generation settles to FAILED and keeps the facts.
+    report = first.get(f"/api/v1/reading-sessions/{session}").json()["data"]["report"]
+    assert report == {**data["report"], "status": "FAILED"}
+    replay = first.post(url, headers=headers, json={**finish, "clientEventId": "end-2", "expectedRevision": 2})
+    assert replay.status_code == 200 and replay.json() == done.json()  # original response, still PENDING
+    changed = first.post(url, headers=headers, json={**finish, "clientEventId": "end-2", "expectedRevision": 3})
+    assert changed.status_code == 409 and changed.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    repeat = first.post(url, headers=headers, json={**finish, "clientEventId": "end-3", "expectedRevision": 3})
+    assert repeat.status_code == 200
+    assert repeat.json()["data"]["session"] == {**data["session"]}
+    assert repeat.json()["data"]["report"]["status"] == "FAILED"
+    late_page = first.post(events, headers=headers, json={"eventType": "PAGE_CHANGED", "pageNumber": 2,
+                                                          "expectedRevision": 3, "clientEventId": "late"})
+    assert late_page.status_code == 409 and late_page.json()["error"]["code"] == "SESSION_CONFLICT"
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT status, end_reason, revision FROM reading_sessions WHERE id = ?",
+                          (session,)).fetchone() == ("FINISHED", "USER_FINISH", 3)
+        assert db.execute("SELECT COUNT(*) FROM reading_reports WHERE session_id = ?", (session,)).fetchone()[0] == 1
+
+
+class _FakeAdapter:
+    def __init__(self, result=None, exc=None):
+        self.calls, self.result, self.exc = [], result, exc
+
+    async def generate(self, request):
+        self.calls.append(request)
+        if self.exc:
+            raise self.exc
+        return self.result
+
+
+def test_finish_generates_ready_report_once_with_model(bookshelf, monkeypatch):
+    from app.schemas.agent import ModelGenerateResult
+    first, _, path = bookshelf
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    adapter = _FakeAdapter(ModelGenerateResult(success=True, text=" 今天一起读完了两页，孩子很投入。 "))
+    monkeypatch.setattr(app.state, "model_adapter", adapter, raising=False)
+    session = _started_session(first, headers, path)
+    first.post(f"/api/v1/reading-sessions/{session}/events", headers=headers, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start"})
+    url = f"/api/v1/reading-sessions/{session}/completions"
+    body = {"reason": "USER_FINISH", "expectedRevision": 1, "clientEventId": "end"}
+    assert first.post(url, headers=headers, json=body).json()["data"]["report"]["status"] == "PENDING"
+    report = first.get(f"/api/v1/reading-sessions/{session}").json()["data"]["report"]
+    assert report["status"] == "READY" and report["summary"] == "今天一起读完了两页，孩子很投入。"
+    assert len(adapter.calls) == 1 and adapter.calls[0].user_input == "本次共读阅读了第 1 页。"
+    assert "text-11" in adapter.calls[0].context_text
+    # Replay and new-key repeats never call the model again.
+    first.post(url, headers=headers, json=body)
+    first.post(url, headers=headers, json={**body, "clientEventId": "again", "expectedRevision": 2})
+    assert len(adapter.calls) == 1
+
+
+def test_finish_model_failure_keeps_fact_summary(bookshelf, monkeypatch):
+    first, _, path = bookshelf
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    monkeypatch.setattr(app.state, "model_adapter", _FakeAdapter(exc=RuntimeError("boom")), raising=False)
+    session = _started_session(first, headers, path, pages=1)
+    first.post(f"/api/v1/reading-sessions/{session}/events", headers=headers, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start"})
+    first.post(f"/api/v1/reading-sessions/{session}/completions", headers=headers,
+               json={"reason": "USER_FINISH", "expectedRevision": 1, "clientEventId": "end"})
+    report = first.get(f"/api/v1/reading-sessions/{session}").json()["data"]["report"]
+    assert report == {"readingSessionId": session, "summary": "本次共读阅读了第 1 页。",
+                      "activities": [], "status": "FAILED"}
+
+
+def test_startup_recovery_fails_leftover_pending_reports(bookshelf):
+    first, _, path = bookshelf
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    pending = _started_session(first, headers, path, pages=1)
+    profile = first.get("/api/v1/child-profiles").json()["data"]["items"][0]["childProfileId"]
+    ready = first.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile, "storyVersionId": 11, "mode": "PARENT_CHILD"}).json()["data"]["readingSessionId"]
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("INSERT INTO reading_reports VALUES (?, 'PENDING', '事实摘要', '[{\"x\":1}]', 1)", (pending,))
+        db.execute("INSERT INTO reading_reports VALUES (?, 'READY', '已生成', '[{\"x\":1}]', 1)", (ready,))
+    with TestClient(app, base_url="https://testserver"):
+        pass  # lifespan startup runs recovery before serving
+    with closing(sqlite3.connect(path)) as db:
+        rows = dict((r[0], r[1:]) for r in db.execute(
+            "SELECT session_id, status, summary, activities_json FROM reading_reports"))
+    assert rows[pending] == ("FAILED", "事实摘要", "[]")
+    assert rows[ready] == ("READY", "已生成", '[{"x":1}]')
+
+
+def test_concurrent_finish_and_page_change_commit_once(bookshelf):
+    first, _, path = bookshelf
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    session = _started_session(first, headers, path)
+    base = f"/api/v1/reading-sessions/{session}"
+    first.post(f"{base}/events", headers=headers, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start"})
+    finish = {"reason": "USER_FINISH", "expectedRevision": 1, "clientEventId": "end"}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        same_key = list(pool.map(lambda _: first.post(f"{base}/completions", headers=headers, json=finish), range(2)))
+    assert [r.status_code for r in same_key] == [200, 200] and same_key[0].json() == same_key[1].json()
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT revision FROM reading_sessions WHERE id = ?", (session,)).fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM request_executions WHERE client_request_id = 'end'").fetchone()[0] == 1
+    # Race: page change and finish both target revision 1 on a fresh session; exactly one wins.
+    profile = first.get("/api/v1/child-profiles").json()["data"]["items"][0]["childProfileId"]
+    race = first.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile, "storyVersionId": 11, "mode": "PARENT_CHILD"}).json()["data"]["readingSessionId"]
+    rbase = f"/api/v1/reading-sessions/{race}"
+    first.post(f"{rbase}/events", headers=headers, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start"})
+    calls = [lambda: first.post(f"{rbase}/completions", headers=headers, json=finish),
+             lambda: first.post(f"{rbase}/events", headers=headers, json={
+                 "eventType": "PAGE_CHANGED", "pageNumber": 2, "expectedRevision": 1, "clientEventId": "page"})]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda call: call(), calls))
+    codes = sorted(r.status_code for r in results)
+    assert codes in ([200, 409], [201, 409])
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT revision FROM reading_sessions WHERE id = ?", (race,)).fetchone()[0] == 2

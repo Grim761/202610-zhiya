@@ -9,13 +9,14 @@ from datetime import datetime, timezone
 from typing import Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, Path, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Path, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.v1.auth import connect, error
 from app.api.v1.profiles import guardian
 from app.api.v1.storybooks import VISIBLE
+from app.services.reading_reports import fact_summary, generate_report, report_object
 
 router = APIRouter(prefix="/api/v1/reading-sessions")
 MAX_ID = 9007199254740991
@@ -26,6 +27,14 @@ class SessionCreate(BaseModel):
     childProfileId: int = Field(ge=1, le=MAX_ID, strict=True)
     storyVersionId: int = Field(ge=1, le=MAX_ID, strict=True)
     mode: Literal["PARENT_CHILD"]
+
+
+class Completion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # TIME_LIMIT is server-triggered and CONTINUED belongs to continuation switching.
+    reason: Literal["USER_FINISH"]
+    expectedRevision: int = Field(ge=0, le=MAX_ID, strict=True)
+    clientEventId: str = Field(min_length=1, max_length=64)
 
 
 class ReadingEvent(BaseModel):
@@ -137,63 +146,86 @@ def get_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
                 (session_id,),
             ).fetchall()
             report = db.execute("SELECT * FROM reading_reports WHERE session_id = ?", (session_id,)).fetchone()
-            report_data = None
-            if report:
-                report_data = {"readingSessionId": session_id, "status": report["status"],
-                               "summary": report["summary"],
-                               "activities": (json.loads(report["activities_json"] or "[]")
-                                              if report["status"] == "READY" else [])}
             return {"data": {"session": session_object(row),
                              "events": [{"interactionEventId": e["id"], "eventType": e["event_type"],
                                          "pageNumber": e["page_no"]} for e in events],
-                             "report": report_data}, "requestId": str(uuid4())}
+                             "report": report_object(session_id, report)}, "requestId": str(uuid4())}
     except sqlite3.Error:
         return error(503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
 
 
+def request_digest(path: str, body: dict) -> str:
+    canonical = json.dumps({"method": "POST", "path": path, "body": body},
+                           sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def owned_session(db, session_id: int, owner: int):
+    return db.execute(
+        """SELECT s.* FROM reading_sessions s
+        JOIN child_profiles p ON p.id = s.profile_id
+        JOIN story_versions v ON v.id = s.version_id
+        JOIN storybooks b ON b.id = v.storybook_id
+        WHERE s.id = ? AND p.guardian_id = ? AND """ + SESSION_ACCESS,
+        (session_id, owner, owner, owner),
+    ).fetchone()
+
+
+def replay_session_event(db, session_id: int, client_event_id: str, digest: str):
+    """Shared SESSION_EVENT lookup for events/completions (and later questions/guidance/branches).
+
+    Returns a response when the key was already used, otherwise None.
+    """
+    previous = db.execute("""SELECT request_digest, status, response_status, response_body, deadline_at
+                          FROM request_executions WHERE scope_type = 'SESSION_EVENT'
+                          AND scope_id = ? AND client_request_id = ?""",
+                          (session_id, client_event_id)).fetchone()
+    if not previous:
+        return None
+    if previous["request_digest"] != digest:
+        return error(409, "IDEMPOTENCY_CONFLICT", "请求标识已用于其他操作")
+    if previous["status"] == "RUNNING":
+        now = int(time.time() * 1000)
+        if previous["deadline_at"] <= now:
+            failure = error(504, "REQUEST_OUTCOME_UNKNOWN", "请求结果未知，请先查询会话")
+            db.execute("""UPDATE request_executions SET status = 'UNKNOWN', completed_at = ?,
+                          response_status = 504, response_body = ? WHERE scope_type = 'SESSION_EVENT'
+                          AND scope_id = ? AND client_request_id = ? AND status = 'RUNNING'
+                          AND deadline_at <= ?""",
+                       (now, failure.body.decode('utf-8'), session_id, client_event_id, now))
+            return failure
+        return error(409, "REQUEST_IN_PROGRESS", "请求正在处理", retryable=True, headers={"Retry-After": "1"})
+    if previous["status"] == "UNKNOWN":
+        return error(504, "REQUEST_OUTCOME_UNKNOWN", "请求结果未知，请先查询会话")
+    return JSONResponse(status_code=200 if previous["status"] == "SUCCEEDED" else previous["response_status"],
+                        content=json.loads(previous["response_body"]))
+
+
+def record_session_event(db, owner: int, session_id: int, client_event_id: str, digest: str,
+                         now: int, status_code: int, response: dict) -> None:
+    db.execute("""INSERT INTO request_executions
+        (owner_account_id, session_id, scope_type, scope_id, client_request_id, request_digest,
+         status, execution_token, started_at, deadline_at, completed_at, response_status, response_body)
+        VALUES (?, ?, 'SESSION_EVENT', ?, ?, ?, 'SUCCEEDED', ?, ?, ?, ?, ?, ?)""",
+        (owner, session_id, session_id, client_event_id, digest, str(uuid4()), now, now + 25000,
+         now, status_code, json.dumps(response, ensure_ascii=False)))
+
+
 @router.post("/{session_id}/events", status_code=201)
 def add_reading_event(payload: ReadingEvent, request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
-    canonical = json.dumps({"method": "POST", "path": f"/api/v1/reading-sessions/{session_id}/events",
-                            "body": payload.model_dump()}, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    digest = request_digest(f"/api/v1/reading-sessions/{session_id}/events", payload.model_dump())
     try:
         with closing(connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
             owner, failure = guardian(db, request, write=True)
             if failure:
                 return failure
-            row = db.execute(
-                """SELECT s.* FROM reading_sessions s
-                JOIN child_profiles p ON p.id = s.profile_id
-                JOIN story_versions v ON v.id = s.version_id
-                JOIN storybooks b ON b.id = v.storybook_id
-                WHERE s.id = ? AND p.guardian_id = ? AND """ + SESSION_ACCESS,
-                (session_id, owner, owner, owner),
-            ).fetchone()
+            row = owned_session(db, session_id, owner)
             if not row:
                 return error(404, "RESOURCE_NOT_FOUND", "会话不可用")
-            previous = db.execute("""SELECT request_digest, status, response_status, response_body, deadline_at
-                                  FROM request_executions WHERE scope_type = 'SESSION_EVENT'
-                                  AND scope_id = ? AND client_request_id = ?""",
-                                  (session_id, payload.clientEventId)).fetchone()
-            if previous:
-                if previous["request_digest"] != digest:
-                    return error(409, "IDEMPOTENCY_CONFLICT", "请求标识已用于其他操作")
-                if previous["status"] == "RUNNING":
-                    now = int(time.time() * 1000)
-                    if previous["deadline_at"] <= now:
-                        failure = error(504, "REQUEST_OUTCOME_UNKNOWN", "请求结果未知，请先查询会话")
-                        db.execute("""UPDATE request_executions SET status = 'UNKNOWN', completed_at = ?,
-                                      response_status = 504, response_body = ? WHERE scope_type = 'SESSION_EVENT'
-                                      AND scope_id = ? AND client_request_id = ? AND status = 'RUNNING'
-                                      AND deadline_at <= ?""",
-                                   (now, failure.body.decode('utf-8'), session_id, payload.clientEventId, now))
-                        return failure
-                    return error(409, "REQUEST_IN_PROGRESS", "请求正在处理", retryable=True, headers={"Retry-After": "1"})
-                if previous["status"] == "UNKNOWN":
-                    return error(504, "REQUEST_OUTCOME_UNKNOWN", "请求结果未知，请先查询会话")
-                return JSONResponse(status_code=200 if previous["status"] == "SUCCEEDED" else previous["response_status"],
-                                    content=json.loads(previous["response_body"]))
+            replay = replay_session_event(db, session_id, payload.clientEventId, digest)
+            if replay is not None:
+                return replay
             if row["revision"] != payload.expectedRevision:
                 return error(409, "SESSION_CONFLICT", "会话状态已变化")
             if payload.eventType == "STARTED":
@@ -219,12 +251,58 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
             response = {"data": {"interactionEventId": cursor.lastrowid, "revision": revision}, "requestId": str(uuid4())}
             db.execute("UPDATE interaction_events SET response_json = ? WHERE id = ?",
                        (json.dumps(response, ensure_ascii=False), cursor.lastrowid))
-            db.execute("""INSERT INTO request_executions
-                (owner_account_id, session_id, scope_type, scope_id, client_request_id, request_digest,
-                 status, execution_token, started_at, deadline_at, completed_at, response_status, response_body)
-                VALUES (?, ?, 'SESSION_EVENT', ?, ?, ?, 'SUCCEEDED', ?, ?, ?, ?, 201, ?)""",
-                (owner, session_id, session_id, payload.clientEventId, digest, str(uuid4()), now, now + 25000,
-                 now, json.dumps(response, ensure_ascii=False)))
+            record_session_event(db, owner, session_id, payload.clientEventId, digest, now, 201, response)
             return JSONResponse(status_code=201, content=response)
     except sqlite3.Error:
         return error(503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
+
+
+@router.post("/{session_id}/completions")
+def finish_session(payload: Completion, request: Request, background: BackgroundTasks,
+                   session_id: int = Path(ge=1, le=MAX_ID)):
+    """API-019 USER_FINISH (DCL-006 candidate rules). Report generation runs after commit."""
+    digest = request_digest(f"/api/v1/reading-sessions/{session_id}/completions", payload.model_dump())
+    try:
+        with closing(connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            owner, failure = guardian(db, request, write=True)
+            if failure:
+                return failure
+            row = owned_session(db, session_id, owner)
+            if not row:
+                return error(404, "RESOURCE_NOT_FOUND", "会话不可用")
+            replay = replay_session_event(db, session_id, payload.clientEventId, digest)
+            if replay is not None:
+                return replay
+            now = int(time.time() * 1000)
+            generation = None
+            if row["status"] == "FINISHED":
+                # New key after finish: existing terminal state and current report, no model call.
+                report = db.execute("SELECT * FROM reading_reports WHERE session_id = ?", (session_id,)).fetchone()
+            elif row["status"] == "IN_PROGRESS" and row["revision"] == payload.expectedRevision:
+                visited = json.loads(row["visited_pages_json"])
+                facts = fact_summary(visited)
+                db.execute("""UPDATE reading_sessions SET status = 'FINISHED', end_reason = 'USER_FINISH',
+                           ended_at = ?, revision = revision + 1 WHERE id = ? AND revision = ?""",
+                           (now, session_id, row["revision"]))
+                db.execute("""INSERT INTO reading_reports (session_id, status, summary, activities_json, updated_at)
+                           VALUES (?, 'PENDING', ?, '[]', ?)""", (session_id, facts, now))
+                pages = list(dict.fromkeys(visited))
+                texts = [r[0] for r in db.execute(
+                    "SELECT body_text FROM story_pages WHERE version_id = ? AND page_no IN (%s) ORDER BY page_no"
+                    % ",".join("?" * len(pages)), (row["version_id"], *pages))] if pages else []
+                generation = (facts, texts)
+                report = db.execute("SELECT * FROM reading_reports WHERE session_id = ?", (session_id,)).fetchone()
+            else:
+                return error(409, "SESSION_CONFLICT", "阅读进度已更新，请刷新后再结束")
+            current = db.execute("SELECT *, NULL AS grant_expires_at FROM reading_sessions WHERE id = ?",
+                                 (session_id,)).fetchone()
+            response = {"data": {"session": session_object(current), "report": report_object(session_id, report)},
+                        "requestId": str(uuid4())}
+            record_session_event(db, owner, session_id, payload.clientEventId, digest, now, 200, response)
+    except sqlite3.Error:
+        return error(503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
+    if generation is not None:
+        background.add_task(generate_report, session_id, *generation,
+                            getattr(request.app.state, "model_adapter", None))
+    return JSONResponse(status_code=200, content=response)
