@@ -109,10 +109,13 @@ def test_reading_session_create_recovery_and_isolation(bookshelf):
     assert first.post("/api/v1/reading-sessions", headers=headers,
                       json={**body, "storyVersionId": 41}).status_code == 404
     # Continuation switching is deliberately not accepted by the ordinary create path.
-    assert first.post("/api/v1/reading-sessions", headers=headers,
-                      json={**body, "sourceReadingSessionId": 1}).status_code == 422
+    with TestClient(app, base_url="https://testserver") as anon:
+        anon_res = anon.get("/api/v1/reading-sessions")
+        assert anon_res.status_code == 401 and anon_res.json()["requestId"] == anon_res.headers["X-Request-ID"]
+    invalid_res = first.post("/api/v1/reading-sessions", headers=headers, json={**body, "sourceReadingSessionId": 1})
+    assert invalid_res.status_code == 422 and invalid_res.json()["requestId"] == invalid_res.headers["X-Request-ID"]
     response = first.post("/api/v1/reading-sessions", headers=headers, json=body)
-    assert response.status_code == 201
+    assert response.status_code == 201 and response.json()["requestId"] == response.headers["X-Request-ID"]
     session = response.json()["data"]
     session_id = session["readingSessionId"]
     assert (session["currentPage"], session["visitedPageNumbers"], session["status"], session["revision"]) == (1, [], "CREATED", 0)
@@ -161,12 +164,17 @@ def test_reading_event_transitions_and_idempotency(bookshelf):
     url = f"/api/v1/reading-sessions/{session}/events"
     started = {"eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start"}
     assert second.post(url, headers=other, json=started).status_code == 404
-    assert first.post(url, json=started).status_code == 403
+    csrf_err = first.post(url, json=started)
+    assert csrf_err.status_code == 403 and csrf_err.json()["requestId"] == csrf_err.headers["X-Request-ID"]
     initial = first.post(url, headers=headers, json=started)
     assert initial.status_code == 201 and initial.json()["data"]["revision"] == 1
+    assert initial.json()["requestId"] == initial.headers["X-Request-ID"]
     replay = first.post(url, headers=headers, json=started)
-    assert replay.status_code == 200 and replay.json() == initial.json()
-    assert first.post(url, headers=headers, json={**started, "pageNumber": 2}).json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert replay.status_code == 200 and replay.json()["data"] == initial.json()["data"]
+    assert replay.json()["requestId"] == replay.headers["X-Request-ID"] != initial.json()["requestId"]
+    conflict = first.post(url, headers=headers, json={**started, "pageNumber": 2})
+    assert conflict.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert conflict.json()["requestId"] == conflict.headers["X-Request-ID"]
     change = {"eventType": "PAGE_CHANGED", "pageNumber": 2, "expectedRevision": 1, "clientEventId": "page"}
     assert first.post(url, headers=headers, json={**change, "pageNumber": 5}).status_code == 409
     assert first.post(url, headers=headers, json=change).status_code == 201
@@ -207,11 +215,15 @@ def test_running_request_expires_to_unknown_without_reexecution(bookshelf):
              'running', ?, 'RUNNING', 'token', ?, ?)""", (session, session, digest, now, now + 60000))
     response = first.post(url, headers=headers, json=body)
     assert response.status_code == 409 and response.json()["error"]["code"] == "REQUEST_IN_PROGRESS"
+    assert response.json()["requestId"] == response.headers["X-Request-ID"]
     assert response.headers["Retry-After"] == "1"
     with closing(sqlite3.connect(path)) as db, db:
         db.execute("UPDATE request_executions SET started_at = 1, deadline_at = 2 WHERE client_request_id = 'running'")
-    assert first.post(url, headers=headers, json=body).json()["error"]["code"] == "REQUEST_OUTCOME_UNKNOWN"
-    assert first.post(url, headers=headers, json=body).status_code == 504
+    timeout = first.post(url, headers=headers, json=body)
+    assert timeout.status_code == 504 and timeout.json()["error"]["code"] == "REQUEST_OUTCOME_UNKNOWN"
+    assert timeout.json()["requestId"] == timeout.headers["X-Request-ID"]
+    unknown = first.post(url, headers=headers, json=body)
+    assert unknown.status_code == 504 and unknown.json()["requestId"] == unknown.headers["X-Request-ID"]
     with closing(sqlite3.connect(path)) as db:
         assert db.execute("SELECT status FROM request_executions WHERE client_request_id = 'running'").fetchone()[0] == "UNKNOWN"
         assert db.execute("SELECT COUNT(*) FROM interaction_events WHERE session_id = ?", (session,)).fetchone()[0] == 0
@@ -230,7 +242,8 @@ def test_concurrent_event_retries_commit_once(bookshelf):
     with ThreadPoolExecutor(max_workers=2) as pool:
         responses = list(pool.map(lambda _: first.post(url, headers=headers, json=body), range(2)))
     assert sorted(response.status_code for response in responses) == [200, 201]
-    assert responses[0].json() == responses[1].json()
+    assert responses[0].json()["data"] == responses[1].json()["data"]
+    assert all(r.json()["requestId"] == r.headers["X-Request-ID"] for r in responses)
     with closing(sqlite3.connect(path)) as db:
         assert db.execute("SELECT COUNT(*) FROM interaction_events WHERE session_id = ?", (session,)).fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM request_executions WHERE session_id = ?", (session,)).fetchone()[0] == 1
@@ -278,17 +291,20 @@ def test_finish_reading_lifecycle_replay_and_conflicts(bookshelf):
     assert stale.status_code == 409 and stale.json()["error"]["code"] == "SESSION_CONFLICT"
 
     done = first.post(url, headers=headers, json={**finish, "clientEventId": "end-2", "expectedRevision": 2})
-    assert done.status_code == 200
+    assert done.status_code == 200 and done.json()["requestId"] == done.headers["X-Request-ID"]
     data = done.json()["data"]
     assert data["session"]["status"] == "FINISHED" and data["session"]["revision"] == 3
     assert data["session"]["visitedPageNumbers"] == [1, 2]
     assert data["report"] == {"readingSessionId": session, "summary": "本次共读阅读了第 1、2 页。",
                               "activities": [], "status": "PENDING"}
     # Without a configured model the post-commit generation settles to FAILED and keeps the facts.
-    report = first.get(f"/api/v1/reading-sessions/{session}").json()["data"]["report"]
+    detail = first.get(f"/api/v1/reading-sessions/{session}")
+    assert detail.status_code == 200 and detail.json()["requestId"] == detail.headers["X-Request-ID"]
+    report = detail.json()["data"]["report"]
     assert report == {**data["report"], "status": "FAILED"}
     replay = first.post(url, headers=headers, json={**finish, "clientEventId": "end-2", "expectedRevision": 2})
-    assert replay.status_code == 200 and replay.json() == done.json()  # original response, still PENDING
+    assert replay.status_code == 200 and replay.json()["data"] == done.json()["data"]  # original response, still PENDING
+    assert replay.json()["requestId"] == replay.headers["X-Request-ID"] != done.json()["requestId"]
     changed = first.post(url, headers=headers, json={**finish, "clientEventId": "end-2", "expectedRevision": 3})
     assert changed.status_code == 409 and changed.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
     repeat = first.post(url, headers=headers, json={**finish, "clientEventId": "end-3", "expectedRevision": 3})
@@ -380,7 +396,9 @@ def test_concurrent_finish_and_page_change_commit_once(bookshelf):
     finish = {"reason": "USER_FINISH", "expectedRevision": 1, "clientEventId": "end"}
     with ThreadPoolExecutor(max_workers=2) as pool:
         same_key = list(pool.map(lambda _: first.post(f"{base}/completions", headers=headers, json=finish), range(2)))
-    assert [r.status_code for r in same_key] == [200, 200] and same_key[0].json() == same_key[1].json()
+    assert [r.status_code for r in same_key] == [200, 200]
+    assert same_key[0].json()["data"] == same_key[1].json()["data"]
+    assert all(r.json()["requestId"] == r.headers["X-Request-ID"] for r in same_key)
     with closing(sqlite3.connect(path)) as db:
         assert db.execute("SELECT revision FROM reading_sessions WHERE id = ?", (session,)).fetchone()[0] == 2
         assert db.execute("SELECT COUNT(*) FROM request_executions WHERE client_request_id = 'end'").fetchone()[0] == 1

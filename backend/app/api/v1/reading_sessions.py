@@ -197,8 +197,10 @@ def replay_session_event(db, request: Request, session_id: int, client_event_id:
         return error(request, 409, "REQUEST_IN_PROGRESS", "请求正在处理", retryable=True, headers={"Retry-After": "1"})
     if previous["status"] == "UNKNOWN":
         return error(request, 504, "REQUEST_OUTCOME_UNKNOWN", "请求结果未知，请先查询会话")
+    body = json.loads(previous["response_body"])
+    body["requestId"] = request.state.request_id
     return JSONResponse(status_code=200 if previous["status"] == "SUCCEEDED" else previous["response_status"],
-                        content=json.loads(previous["response_body"]))
+                        content=body)
 
 
 def record_session_event(db, owner: int, session_id: int, client_event_id: str, digest: str,
