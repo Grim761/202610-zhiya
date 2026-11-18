@@ -39,7 +39,7 @@ def version_object(db, row):
     return {
         "storybookId": row["storybook_id"], "storyVersionId": row["id"],
         "versionNumber": row["version_no"], "title": row["title"], "status": row["status"],
-        "coverRef": cover_ref_for(row["storybook_id"], row["id"], source_type, row["source_ref"]),
+        "coverRef": cover_ref_for(row["storybook_id"], row["id"], row["version_no"], source_type, row["source_ref"]),
         "pages": [page_object(p) for p in pages],
         "branches": [{"branchId": b["id"], "fromPageNumber": b["from_page_no"],
                       "nextPageNumber": b["next_page_no"], "choiceLabel": b["choice_label"],

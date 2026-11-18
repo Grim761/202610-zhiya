@@ -11,7 +11,14 @@ from fastapi.testclient import TestClient
 from app.api.v1.auth import _login_attempts
 from app.config import Settings
 from app.main import app, create_app
-from app.services.story_media import REPO_ROOT, SEED_COVER_SOURCE_REF
+from app.services import story_media
+from app.services.story_media import (
+    DEFAULT_MEDIA_ROOT,
+    REPO_ROOT,
+    SEED_COVER_SOURCE_REF,
+    detect_image_type,
+    resolve_cover_asset,
+)
 from app.speech_config import SpeechSettings
 
 SCHEMA = Path(__file__).resolve().parents[2] / "database" / "schema.sql"
@@ -264,3 +271,125 @@ def test_branch_media_expired_child_grant_and_voice_media_compatibility(tmp_path
             settled = db.execute("SELECT status, end_reason FROM reading_sessions WHERE id = ?", (sid2,)).fetchone()
         assert settled == ("FINISHED", "TIME_LIMIT")
     _login_attempts.clear()
+
+
+PNG = b"\x89PNG\r\n\x1a\n"
+JPEG = b"\xff\xd8\xff\xe0"
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _library_book(db_path, version_id, storybook_id, version_no, images, *, status="PUBLISHED", seed_cover=True):
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("PRAGMA foreign_keys = ON")
+        db.execute("INSERT OR IGNORE INTO storybooks VALUES (?, NULL, 'LIBRARY', 1)", (storybook_id,))
+        db.execute("""INSERT INTO story_versions
+            (id, storybook_id, version_no, title, topics_json, age_min, age_max,
+             source_ref, license_note, status, reviewed_by_id, reviewed_at, created_at, branching)
+            VALUES (?, ?, ?, '封面绘本', '["动物"]', 3, 5, ?, 'ok', ?, 1, 1, 1, 0)""",
+                   (version_id, storybook_id, version_no, SEED_COVER_SOURCE_REF if seed_cover else None, status))
+        for page_no, image in enumerate(images, start=1):
+            db.execute("INSERT INTO story_pages (version_id, page_no, body_text, image_ref) VALUES (?, ?, 't', ?)",
+                       (version_id, page_no, image))
+
+
+def test_docker_image_packages_every_seed_cover():
+    mapping = json.loads((ROOT / "data" / "seed" / "cover_mapping.json").read_text(encoding="utf-8"))
+    dockerfile = (ROOT / "infra" / "Dockerfile").read_text(encoding="utf-8")
+    ignore = (ROOT / "infra" / "Dockerfile.dockerignore").read_text(encoding="utf-8").splitlines()
+    assert "COPY knowledge-base_v2.5/图片/ /app/knowledge-base_v2.5/图片/" in dockerfile
+    allowed = {line[1:] for line in ignore if line.startswith("!")}
+    assert {"knowledge-base_v2.5", "knowledge-base_v2.5/图片"} <= allowed
+    # Rebuild the image directory from the ignore allow-list and resolve every mapping entry there.
+    patterns = [rule.rsplit("*", 1)[-1] for rule in allowed if rule.startswith("knowledge-base_v2.5/图片/*")]
+    assert len(mapping) == 20
+    for entry in mapping:
+        cover = ROOT / entry["cover_path"]
+        assert cover.is_file() and cover.suffix in patterns, entry
+        assert detect_image_type(cover.read_bytes()[:12]) is not None, entry
+
+
+@pytest.mark.parametrize("explicit_root", [False, True])
+def test_repository_mapping_resolves_with_default_and_explicit_media_root(monkeypatch, explicit_root):
+    if explicit_root:
+        monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(DEFAULT_MEDIA_ROOT))
+    else:
+        monkeypatch.delenv("ZHIYA_MEDIA_ROOT", raising=False)
+    monkeypatch.delenv("ZHIYA_COVER_MAPPING_PATH", raising=False)
+    resolved = [resolve_cover_asset(i, 1, "LIBRARY", SEED_COVER_SOURCE_REF) for i in range(1, 100)]
+    assert sum(item is not None for item in resolved) == 20
+
+
+def test_cover_is_pinned_to_the_story_version(media_env, monkeypatch):
+    first, _, db_path, tmp_path = media_env
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    (media_root / "old.png").write_bytes(PNG + b"old-cover")
+    (media_root / "new.png").write_bytes(PNG + b"new-cover")
+    mapping = tmp_path / "covers.json"
+    mapping.write_text(json.dumps([{"storybook_id": 2, "version_no": 1, "cover_path": "old.png"}]), encoding="utf-8")
+    monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(media_root))
+    monkeypatch.setenv("ZHIYA_COVER_MAPPING_PATH", str(mapping))
+    _library_book(db_path, 20, 2, 1, ["none"])
+    assert first.get("/api/v1/media/asset-20-cover").content == PNG + b"old-cover"
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    profile = first.post("/api/v1/child-profiles", headers=headers,
+                         json={"ageBand": "AGE_3_4", "preferredMinutes": 10}).json()["data"]["childProfileId"]
+    session = first.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile, "storyVersionId": 20, "mode": "PARENT_CHILD",
+    })
+    assert session.status_code == 201
+
+    # Publish version 2 with a new cover; the existing session keeps reading version 20's original image.
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE story_versions SET status = 'RETIRED' WHERE id = 20")
+    _library_book(db_path, 21, 2, 2, ["none"])
+    mapping.write_text(json.dumps([
+        {"storybook_id": 2, "version_no": 1, "cover_path": "old.png"},
+        {"storybook_id": 2, "version_no": 2, "cover_path": "new.png"},
+    ]), encoding="utf-8")
+    assert first.get("/api/v1/media/asset-21-cover").content == PNG + b"new-cover"
+    assert first.get("/api/v1/media/asset-20-cover").content == PNG + b"old-cover"
+    assert first.get("/api/v1/story-versions/20").json()["data"]["coverRef"] == "asset-20-cover"
+    assert first.get("/api/v1/story-versions/21").json()["data"]["coverRef"] == "asset-21-cover"
+    assert resolve_cover_asset(2, 3, "LIBRARY", SEED_COVER_SOURCE_REF) is None
+
+
+def test_missing_default_cover_mapping_is_a_retryable_dependency_failure(media_env, monkeypatch):
+    first, _, db_path, tmp_path = media_env
+    _library_book(db_path, 2, 2, 1, [])
+    monkeypatch.delenv("ZHIYA_COVER_MAPPING_PATH", raising=False)
+    monkeypatch.setattr(story_media, "DEFAULT_COVER_MAPPING", tmp_path / "missing.json")
+    for url in ("/api/v1/storybooks", "/api/v1/story-versions/2", "/api/v1/media/asset-2-cover"):
+        res = first.get(url)
+        assert res.status_code == 503, url
+        assert res.json()["error"] == {**res.json()["error"], "code": "DEPENDENCY_UNAVAILABLE", "retryable": True}
+    # A single unmapped book is a confirmed missing image, not a dependency failure.
+    monkeypatch.setattr(story_media, "DEFAULT_COVER_MAPPING", ROOT / "data" / "seed" / "cover_mapping.json")
+    _library_book(db_path, 40, 40, 1, [])
+    assert first.get("/api/v1/story-versions/40").json()["data"]["coverRef"] is None
+    assert first.get("/api/v1/media/asset-40-cover").status_code == 404
+
+
+def test_empty_and_mismatched_image_files(media_env, monkeypatch):
+    first, _, db_path, tmp_path = media_env
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    (media_root / "empty.png").write_bytes(b"")
+    (media_root / "text.png").write_bytes(b"not an image at all")
+    (media_root / "photo.png").write_bytes(JPEG + b"actually-jpeg")
+    (media_root / "good.webp").write_bytes(b"RIFF\x00\x00\x00\x00WEBPdata")
+    monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(media_root))
+    _library_book(db_path, 50, 50, 1, ["empty.png", "text.png", "photo.png", "good.webp"], seed_cover=False)
+
+    pages = first.get("/api/v1/story-versions/50").json()["data"]["pages"]
+    assert [p["imageRef"] for p in pages] == [None, None, "asset-50-page-3", "asset-50-page-4"]
+    for page_no in (1, 2):
+        assert first.get(f"/api/v1/media/asset-50-page-{page_no}").status_code == 404
+    photo = first.get("/api/v1/media/asset-50-page-3")
+    assert photo.status_code == 200 and photo.headers["content-type"] == "image/jpeg"
+    assert photo.content == JPEG + b"actually-jpeg"
+    assert first.get("/api/v1/media/asset-50-page-4").headers["content-type"] == "image/webp"
+
+    # A file emptied after its key was issued is never served as a zero-byte success.
+    (media_root / "good.webp").write_bytes(b"")
+    assert first.get("/api/v1/media/asset-50-page-4").status_code == 404
