@@ -28,6 +28,7 @@ from app.services.reading_reports import (
     generate_report,
     report_object,
 )
+from app.services.story_media import MediaDependencyError
 
 router = APIRouter(prefix="/api/v1/reading-sessions")
 MAX_ID = 9007199254740991
@@ -546,6 +547,7 @@ def choose_branch(payload: BranchChoice, request: Request, session_id: int = Pat
             if not next_page:
                 return fail_session_event(db, request, principal.guardian_id, session_id, payload.clientEventId,
                                           digest, 404, "RESOURCE_NOT_FOUND", "目标页面不可用")
+            next_page_data = page_object(next_page)
             now = int(time.time() * 1000)
             revision = row["revision"] + 1
             visited = json.loads(row["visited_pages_json"])
@@ -569,7 +571,7 @@ def choose_branch(payload: BranchChoice, request: Request, session_id: int = Pat
                     "currentPage": next_page["page_no"],
                     "revision": revision,
                     "interactionEventId": cursor.lastrowid,
-                    "nextPage": page_object(next_page),
+                    "nextPage": next_page_data,
                     "visitedPageNumbers": visited,
                 },
                 "requestId": request.state.request_id,
@@ -578,7 +580,7 @@ def choose_branch(payload: BranchChoice, request: Request, session_id: int = Pat
                        (json.dumps(response, ensure_ascii=False), cursor.lastrowid))
             record_session_event(db, principal.guardian_id, session_id, payload.clientEventId, digest, now, 201, response)
             return JSONResponse(status_code=201, content=response)
-    except sqlite3.Error:
+    except (sqlite3.Error, MediaDependencyError):
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
 
 
