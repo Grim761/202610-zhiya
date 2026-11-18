@@ -5,7 +5,6 @@ import hashlib
 import secrets
 import sqlite3
 import time
-from contextlib import closing
 from typing import Annotated, Literal
 from uuid import uuid4
 
@@ -16,24 +15,18 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.api.v1.auth import (
     Principal,
     SESSION_SECONDS,
-    authenticate_request,
-    connect,
+    authorized_db,
     error,
     iso_utc,
     set_session_cookies,
     token_digest,
 )
-from app.api.v1.profiles import guardian, guardian_session
 from app.api.v1.storybooks import VISIBLE
 from app.services.cleanup import delete_session_rows, purge_voice_media
 from app.services.reading_reports import (
-    ensure_startup_recovered,
     fact_summary,
     generate_report,
-    queue_deferred_reports,
     report_object,
-    settle_expired_grants,
-    settle_expired_grants_in_tx,
 )
 
 router = APIRouter(prefix="/api/v1/reading-sessions")
@@ -92,11 +85,10 @@ SESSION_ACCESS = """(v.status = 'PUBLISHED' OR
 @router.post("", status_code=201)
 def create_session(payload: SessionCreate, request: Request):
     try:
-        with closing(connect()) as db, db:
-            db.execute("BEGIN IMMEDIATE")
-            owner, failure = guardian(db, request, write=True, in_write_tx=True)
+        with authorized_db(request, write=True, guardian_only=True) as (db, principal, failure):
             if failure:
                 return failure
+            owner = principal.guardian_id
             profile = db.execute("SELECT 1 FROM child_profiles WHERE id = ? AND guardian_id = ?",
                                  (payload.childProfileId, owner)).fetchone()
             version = db.execute(
@@ -124,12 +116,10 @@ def create_session(payload: SessionCreate, request: Request):
 def list_sessions(request: Request, page: int = Query(default=1, ge=1, le=MAX_ID),
                   pageSize: int = Query(default=20, ge=1, le=50)):
     try:
-        settle_expired_grants(request)
-        with closing(connect()) as db:
-            db.execute("BEGIN")
-            owner, failure = guardian(db, request, write=False)
+        with authorized_db(request, guardian_only=True) as (db, principal, failure):
             if failure:
                 return failure
+            owner = principal.guardian_id
             offset = min((page - 1) * pageSize, 9223372036854775807)
             rows = db.execute(
                 """SELECT s.*, g.expires_at AS grant_expires_at FROM reading_sessions s
@@ -150,19 +140,18 @@ def list_sessions(request: Request, page: int = Query(default=1, ge=1, le=MAX_ID
 @router.get("/{session_id}")
 def get_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
     try:
-        settle_expired_grants(request)
-        with closing(connect()) as db:
-            db.execute("BEGIN")
-            principal, failure = authenticate_request(db, request, write=False)
+        with authorized_db(request) as (db, principal, failure):
             if failure:
                 return failure
             row = owned_session(db, session_id, principal)
             if not row:
                 return error(request, 404, "RESOURCE_NOT_FOUND", "会话不可用")
-            events = db.execute(
-                "SELECT id, event_type, page_no FROM interaction_events WHERE session_id = ? ORDER BY id",
-                (session_id,),
-            ).fetchall()
+            event_query = "SELECT id, event_type, page_no FROM interaction_events WHERE session_id = ?"
+            event_params = [session_id]
+            if principal.role == "CHILD":
+                event_query += " AND page_no = ?"
+                event_params.append(row["current_page_no"])
+            events = db.execute(event_query + " ORDER BY id", event_params).fetchall()
             report = None
             if principal.role == "GUARDIAN":
                 report_row = db.execute("SELECT * FROM reading_reports WHERE session_id = ?", (session_id,)).fetchone()
@@ -181,21 +170,19 @@ def update_mode_settings(payload: ModeSettings, request: Request, session_id: in
     unique_ids = list(dict.fromkeys(payload.allowedStoryVersionIds))
     child_token: str | None = None
     try:
-        with closing(connect()) as db, db:
-            db.execute("BEGIN IMMEDIATE")
-            principal, failure = guardian_session(db, request, write=True, in_write_tx=True)
+        with authorized_db(request, write=True, guardian_only=True) as (db, principal, failure):
             if failure:
                 return failure
             owner = principal.guardian_id
             now = int(time.time() * 1000)
-            queue_deferred_reports(request, settle_expired_grants_in_tx(db, now=now, guardian_id=owner))
             row = db.execute(
-                """SELECT s.* FROM reading_sessions s
+                """SELECT s.*, v.status AS version_status FROM reading_sessions s
                 JOIN child_profiles p ON p.id = s.profile_id
+                JOIN story_versions v ON v.id = s.version_id
                 WHERE s.id = ? AND p.guardian_id = ?""",
                 (session_id, owner),
             ).fetchone()
-            if not row:
+            if not row or row["version_status"] == "WITHDRAWN":
                 return error(request, 404, "RESOURCE_NOT_FOUND", "会话不可用")
             if row["version_id"] not in unique_ids:
                 return error(request, 422, "VALIDATION_ERROR", "授权版本范围须包含当前会话绘本")
@@ -282,11 +269,10 @@ def update_mode_settings(payload: ModeSettings, request: Request, session_id: in
 def delete_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
     """API-014: delete a guardian-owned reading session, its derived rows, and revoke its active grant."""
     try:
-        with closing(connect()) as db, db:
-            db.execute("BEGIN IMMEDIATE")
-            owner, failure = guardian(db, request, write=True, in_write_tx=True)
+        with authorized_db(request, write=True, guardian_only=True, settle_guardian=False) as (db, principal, failure):
             if failure:
                 return failure
+            owner = principal.guardian_id
             row = db.execute(
                 """SELECT s.id, s.grant_id FROM reading_sessions s
                 JOIN child_profiles p ON p.id = s.profile_id
@@ -399,16 +385,9 @@ def fail_session_event(db, request: Request, owner: int, session_id: int, client
 def add_reading_event(payload: ReadingEvent, request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
     digest = request_digest(f"/api/v1/reading-sessions/{session_id}/events", payload.model_dump())
     try:
-        with closing(connect()) as db, db:
-            db.execute("BEGIN IMMEDIATE")
-            principal, failure = authenticate_request(db, request, write=True, in_write_tx=True)
+        with authorized_db(request, write=True) as (db, principal, failure):
             if failure:
                 return failure
-            if principal.role == "GUARDIAN":
-                queue_deferred_reports(
-                    request,
-                    settle_expired_grants_in_tx(db, now=int(time.time() * 1000), guardian_id=principal.guardian_id),
-                )
             row = owned_session(db, session_id, principal)
             if not row:
                 return error(request, 404, "RESOURCE_NOT_FOUND", "会话不可用")
@@ -452,21 +431,11 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
 def finish_session(payload: Completion, request: Request, background: BackgroundTasks,
                    session_id: int = Path(ge=1, le=MAX_ID)):
     """API-019 USER_FINISH (DCL-006 candidate rules). Report generation runs after commit."""
-    # Recovery has its own write transaction and must finish before any new PENDING report exists.
-    if not ensure_startup_recovered():
-        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "阅读小结服务暂不可用")
     digest = request_digest(f"/api/v1/reading-sessions/{session_id}/completions", payload.model_dump())
     try:
-        with closing(connect()) as db, db:
-            db.execute("BEGIN IMMEDIATE")
-            principal, failure = authenticate_request(db, request, write=True, in_write_tx=True)
+        with authorized_db(request, write=True) as (db, principal, failure):
             if failure:
                 return failure
-            if principal.role == "GUARDIAN":
-                queue_deferred_reports(
-                    request,
-                    settle_expired_grants_in_tx(db, now=int(time.time() * 1000), guardian_id=principal.guardian_id),
-                )
             row = owned_session(db, session_id, principal)
             if not row:
                 return error(request, 404, "RESOURCE_NOT_FOUND", "会话不可用")

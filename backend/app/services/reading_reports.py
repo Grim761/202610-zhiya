@@ -159,55 +159,43 @@ def recover_pending_reports() -> bool:
     return ensure_startup_recovered()
 
 
-def _expired_sessions_query(*, guardian_id: int | None = None, grant_id: int | None = None) -> tuple[str, list[object]]:
-    filters = ["g.revoked_at IS NULL", "g.expires_at <= ?", "s.status IN ('CREATED', 'IN_PROGRESS')"]
-    params: list[object] = []
-    if guardian_id is not None:
-        filters.append("p.guardian_id = ?")
-        params.append(guardian_id)
+def unsettled_sessions(db, guardian_id: int, grant_id: int | None, now: int):
+    """Only inspect sessions in the authenticated family or the narrower child grant."""
+    sql = """SELECT s.id, s.status, s.version_id, s.visited_pages_json, g.expires_at,
+                    v.status AS version_status
+             FROM child_profiles p
+             JOIN reading_sessions s ON s.profile_id = p.id
+             JOIN child_grants g ON g.id = s.grant_id
+             JOIN story_versions v ON v.id = s.version_id
+             WHERE p.guardian_id = ? AND g.revoked_at IS NULL
+               AND s.status IN ('CREATED', 'IN_PROGRESS')
+               AND (g.expires_at <= ? OR v.status = 'WITHDRAWN')"""
+    params = [guardian_id, now]
     if grant_id is not None:
-        filters.append("g.id = ?")
+        sql += " AND g.id = ?"
         params.append(grant_id)
-    where = " AND ".join(filters)
-    sql = (
-        "SELECT s.id, s.version_id, s.visited_pages_json, p.guardian_id "
-        "FROM reading_sessions s "
-        "JOIN child_grants g ON g.id = s.grant_id "
-        "JOIN child_profiles p ON p.id = s.profile_id "
-        f"WHERE {where}"
-    )
-    return sql, params
+    return db.execute(sql, params)
 
 
-def settle_expired_grants_in_tx(
-    db: sqlite3.Connection,
-    *,
-    now: int,
-    guardian_id: int | None = None,
-    grant_id: int | None = None,
-) -> list[tuple[int, str, list[str], str]]:
-    """Finalize unfinished sessions tied to expired child grants as FINISHED (TIME_LIMIT).
-
-    Must run inside an active BEGIN IMMEDIATE transaction. Returns pending report generation jobs
-    only for sessions transitioned in this transaction so duplicate checks never trigger repeat work.
-    """
-    sql, extra_params = _expired_sessions_query(guardian_id=guardian_id, grant_id=grant_id)
-    rows = db.execute(sql, (now, *extra_params)).fetchall()
-    if not rows:
-        return []
-    if not ensure_startup_recovered():
-        raise sqlite3.OperationalError("report recovery pending")
+def settle_grant_sessions(db, guardian_id: int, grant_id: int | None, now: int):
+    """Called with the write lock held. The caller dispatches jobs only after commit."""
     pending: list[tuple[int, str, list[str], str]] = []
-    for row in rows:
+    for row in unsettled_sessions(db, guardian_id, grant_id, now).fetchall():
         sid = row["id"]
-        updated = db.execute(
+        if row["version_status"] == "WITHDRAWN" or row["status"] == "CREATED":
+            reason = "CONTENT_WITHDRAWN" if row["version_status"] == "WITHDRAWN" else "GRANT_REVOKED"
+            db.execute(
+                """UPDATE reading_sessions SET status = 'INTERRUPTED', end_reason = ?,
+                   ended_at = ?, revision = revision + 1 WHERE id = ?""",
+                (reason, min(now, row["expires_at"]), sid),
+            )
+            continue
+        db.execute(
             """UPDATE reading_sessions
                SET status = 'FINISHED', end_reason = 'TIME_LIMIT', ended_at = ?, revision = revision + 1
-               WHERE id = ? AND status IN ('CREATED', 'IN_PROGRESS')""",
-            (now, sid),
+               WHERE id = ?""",
+            (row["expires_at"], sid),
         )
-        if updated.rowcount != 1:
-            continue
         visited = json.loads(row["visited_pages_json"])
         facts = fact_summary(visited)
         inserted = db.execute(
@@ -224,7 +212,7 @@ def settle_expired_grants_in_tx(
                 status, execution_token, started_at, deadline_at, completed_at, response_status, response_body)
                VALUES (?, ?, 'SESSION_EVENT', ?, ?, '__time_limit__', 'SUCCEEDED', ?, ?, ?, ?, 200, '{}')""",
             (
-                row["guardian_id"],
+                guardian_id,
                 sid,
                 sid,
                 f"__time_limit__:{sid}:{generation_token[:16]}",
@@ -238,9 +226,7 @@ def settle_expired_grants_in_tx(
         texts = [
             r[0]
             for r in db.execute(
-                "SELECT sp.body_text FROM story_pages sp "
-                "JOIN story_versions sv ON sv.id = sp.version_id "
-                "WHERE sp.version_id = ? AND sv.status <> 'WITHDRAWN' AND sp.page_no IN (%s) ORDER BY sp.page_no"
+                "SELECT body_text FROM story_pages WHERE version_id = ? AND page_no IN (%s) ORDER BY page_no"
                 % ",".join("?" * len(pages)),
                 (row["version_id"], *pages),
             )
@@ -259,16 +245,3 @@ def queue_deferred_reports(request, pending: list[tuple[int, str, list[str], str
     adapter = getattr(request.app.state, "model_adapter", None)
     for sid, facts, texts, gen_token in pending:
         queue.append((generate_report, (sid, facts, texts, adapter), {"generation_token": gen_token}))
-
-
-def settle_expired_grants(request, *, guardian_id: int | None = None, grant_id: int | None = None) -> None:
-    """Best-effort pre-read check that atomically finishes expired child-grant sessions at most once."""
-    now = int(time.time() * 1000)
-    sql, extra_params = _expired_sessions_query(guardian_id=guardian_id, grant_id=grant_id)
-    with closing(connect()) as reader:
-        if not reader.execute(f"SELECT 1 FROM ({sql}) LIMIT 1", (now, *extra_params)).fetchone():
-            return
-    with closing(connect()) as write_db, write_db:
-        write_db.execute("BEGIN IMMEDIATE")
-        pending = settle_expired_grants_in_tx(write_db, now=now, guardian_id=guardian_id, grant_id=grant_id)
-    queue_deferred_reports(request, pending)

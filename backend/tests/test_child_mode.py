@@ -98,6 +98,9 @@ def test_enter_child_mode_scopes_access_voice_and_parent_unlock(child_env, monke
     child_token = first.cookies["zhiya_session"]
     child_headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
     assert child_token != old_guardian_token
+    credentials = {"account": "guardian-one", "password": "strong-pass-123"}
+    assert first.post("/api/v1/auth/sessions", json=credentials).status_code == 403
+    assert first.cookies["zhiya_session"] == child_token
 
     # Old guardian cookie on the same device was revoked in the same transaction.
     stale = TestClient(application, base_url="https://testserver")
@@ -225,7 +228,7 @@ def test_shorten_grant_after_library_retire_and_cookie_retention_after_expiry(ch
     }).status_code == 201
 
     # Second logged-in guardian device can shorten expiresAt (even after LIBRARY 11 retires),
-    # cannot extend or change allowed versions, and rejects shortening once WITHDRAWN.
+    # cannot extend or change allowed versions.
     with closing(sqlite3.connect(path)) as db, db:
         db.execute("UPDATE story_versions SET status = 'RETIRED' WHERE id = 11")
     assert first.get("/api/v1/story-versions/11").status_code == 200
@@ -246,14 +249,6 @@ def test_shorten_grant_after_library_retire_and_cookie_retention_after_expiry(ch
         })
         assert shortened.status_code == 200
 
-        with closing(sqlite3.connect(path)) as db, db:
-            db.execute("UPDATE story_versions SET status = 'WITHDRAWN' WHERE id = 11")
-        assert second_device.put(mode_url, headers=h2, json={
-            "mode": "CHILD_SOLO", "allowedStoryVersionIds": [11], "timeLimitSeconds": 90
-        }).status_code == 404
-        with closing(sqlite3.connect(path)) as db, db:
-            db.execute("UPDATE story_versions SET status = 'RETIRED' WHERE id = 11")
-
     # Once child grant expires, business calls fail 401 and session transitions atomically to FINISHED (TIME_LIMIT)
     # with a single API-019 report generation; surviving cookies allow API-021 parent unlock past child TTL.
     with closing(sqlite3.connect(path)) as db, db:
@@ -267,6 +262,9 @@ def test_shorten_grant_after_library_retire_and_cookie_retention_after_expiry(ch
         assert child_past_ttl.post("/api/v1/voice/syntheses", headers=child_headers, json={
             "readingSessionId": sid, "pageNumber": 1, "revision": 1
         }).status_code == 401
+        assert child_past_ttl.post("/api/v1/auth/sessions", json={
+            "account": "guardian-one", "password": "strong-pass-123"
+        }).status_code == 403
         unlock = child_past_ttl.post("/api/v1/auth/parent-unlocks", headers=child_headers,
                                      json={"account": "guardian-one", "password": "strong-pass-123"})
         assert unlock.status_code == 200
@@ -318,8 +316,9 @@ def test_guardian_read_after_expiry_settles_time_limit_once(child_env, monkeypat
         }).status_code == 201
 
         # Grant expires without any further request from child device; guardian checks twice.
-        with closing(sqlite3.connect(path)) as db, db:
-            db.execute("UPDATE child_grants SET issued_at = 1, expires_at = 60001")
+        with closing(sqlite3.connect(path)) as db:
+            expires_at = db.execute("SELECT expires_at FROM child_grants").fetchone()[0]
+        monkeypatch.setattr(time, "time", lambda: expires_at / 1000 + 7200)
         r1 = second_device.get(f"/api/v1/reading-sessions/{sid}")
         r2 = second_device.get(f"/api/v1/reading-sessions/{sid}")
         assert r1.status_code == 200 and r1.json()["data"]["session"]["status"] == "FINISHED"
@@ -327,6 +326,8 @@ def test_guardian_read_after_expiry_settles_time_limit_once(child_env, monkeypat
         assert r2.status_code == 200 and r2.json()["data"]["report"]["status"] == "READY"
         assert r2.json()["data"]["report"]["summary"] == "本次共读阅读了第 1 页。"
         assert len(adapter.calls) == 1
+        with closing(sqlite3.connect(path)) as db:
+            assert db.execute("SELECT ended_at FROM reading_sessions WHERE id=?", (sid,)).fetchone() == (expires_at,)
         assert second_device.get("/api/v1/reading-sessions").json()["data"]["items"][0]["status"] == "FINISHED"
 
 
@@ -371,3 +372,137 @@ def test_child_and_other_guardian_device_logout_revoke_grants(child_env):
             assert db.execute("SELECT status, end_reason FROM reading_sessions WHERE id = ?", (sid2,)).fetchone() == (
                 "INTERRUPTED", "GRANT_REVOKED"
             )
+
+
+def _enter_session(client, profile_id, *, seconds=600):
+    headers = {"X-CSRF-Token": client.cookies["zhiya_csrf"]}
+    created = client.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile_id, "storyVersionId": 11, "mode": "PARENT_CHILD",
+    })
+    assert created.status_code == 201
+    sid = created.json()["data"]["readingSessionId"]
+    entered = client.put(f"/api/v1/reading-sessions/{sid}/mode-settings", headers=headers, json={
+        "mode": "CHILD_SOLO", "allowedStoryVersionIds": [11], "timeLimitSeconds": seconds,
+    })
+    assert entered.status_code == 200
+    return sid
+
+
+def _start(client, sid):
+    response = client.post(f"/api/v1/reading-sessions/{sid}/events",
+                           headers={"X-CSRF-Token": client.cookies["zhiya_csrf"]}, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start",
+    })
+    assert response.status_code == 201
+
+
+@pytest.fixture
+def timed_session(child_env, monkeypatch):
+    application, child, _, path, profile_id = child_env
+    model = AsyncMock()
+    model.generate.return_value = ModelGenerateResult(success=True, text='{"suggestionId":"NONE"}')
+    monkeypatch.setattr(application.state, "model_adapter", model)
+    sid = _enter_session(child, profile_id, seconds=60)
+    with closing(sqlite3.connect(path)) as db:
+        expires_at = db.execute("SELECT expires_at FROM child_grants").fetchone()[0]
+    with closing(TestClient(application, base_url="https://testserver")) as guardian:
+        assert guardian.post("/api/v1/auth/sessions", json={
+            "account": "guardian-one", "password": "strong-pass-123",
+        }).status_code == 201
+        yield guardian, sid, expires_at, model
+
+
+def test_reads_settle_only_the_authenticated_family_or_child_grant(child_env, timed_session, monkeypatch):
+    application, child, other_family, path, profile_id = child_env
+    _, sid, expires_at, model = timed_session
+    _start(child, sid)
+    with closing(TestClient(application, base_url="https://testserver")) as sibling:
+        assert sibling.post("/api/v1/auth/sessions", json={
+            "account": "guardian-one", "password": "strong-pass-123",
+        }).status_code == 201
+        other_sid = _enter_session(sibling, profile_id, seconds=1800)
+        monkeypatch.setattr(time, "time", lambda: expires_at / 1000 + 1)
+        assert other_family.get("/api/v1/storybooks").status_code == 200
+        assert sibling.get(f"/api/v1/reading-sessions/{other_sid}").status_code == 200
+        with closing(TestClient(application, base_url="https://testserver")) as anonymous:
+            assert anonymous.get("/api/v1/child-profiles").status_code == 401
+        with closing(sqlite3.connect(path)) as db:
+            assert db.execute("SELECT status FROM reading_sessions WHERE id=?", (sid,)).fetchone() == ("IN_PROGRESS",)
+        model.generate.assert_not_awaited()
+        assert child.get("/api/v1/media/missing").status_code == 401
+        model.generate.assert_awaited_once()
+
+
+def test_child_session_detail_returns_current_page_events(child_env, timed_session):
+    _, child, _, _, _ = child_env
+    guardian, sid, _, _ = timed_session
+    _start(child, sid)
+    url = f"/api/v1/reading-sessions/{sid}"
+    assert child.post(url + "/events", headers={"X-CSRF-Token": child.cookies["zhiya_csrf"]}, json={
+        "eventType": "PAGE_CHANGED", "pageNumber": 2, "expectedRevision": 1, "clientEventId": "next",
+    }).status_code == 201
+    child_view = child.get(url).json()["data"]
+    assert child_view["report"] is None
+    assert [e["pageNumber"] for e in child_view["events"]] == [2]
+    assert [e["pageNumber"] for e in guardian.get(url).json()["data"]["events"]] == [1, 2]
+
+
+@pytest.mark.parametrize("withdrawn, reason", [(False, "GRANT_REVOKED"), (True, "CONTENT_WITHDRAWN")])
+def test_interrupted_grants_never_generate_completion_reports(child_env, timed_session, monkeypatch, withdrawn, reason):
+    _, child, _, path, _ = child_env
+    guardian, sid, expires_at, model = timed_session
+    url = f"/api/v1/reading-sessions/{sid}"
+    if withdrawn:
+        _start(child, sid)
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute("UPDATE story_versions SET status='WITHDRAWN' WHERE id=11")
+        headers = {"X-CSRF-Token": guardian.cookies["zhiya_csrf"]}
+        assert guardian.put(url + "/mode-settings", headers=headers, json={
+            "mode": "CHILD_SOLO", "allowedStoryVersionIds": [11], "timeLimitSeconds": 60,
+        }).status_code == 404
+    monkeypatch.setattr(time, "time", lambda: expires_at / 1000 + 1)
+    assert guardian.get(url).status_code == (404 if withdrawn else 200)
+    assert child.post("/api/v1/auth/parent-unlocks", headers={"X-CSRF-Token": child.cookies["zhiya_csrf"]},
+                      json={"account": "guardian-one", "password": "strong-pass-123"}).status_code == 200
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT status, end_reason FROM reading_sessions WHERE id=?", (sid,)).fetchone() == (
+            "INTERRUPTED", reason,
+        )
+        assert db.execute("SELECT COUNT(*) FROM reading_reports WHERE session_id=?", (sid,)).fetchone() == (0,)
+    model.generate.assert_not_awaited()
+
+
+def test_rolled_back_logout_does_not_dispatch_report(child_env, timed_session, monkeypatch):
+    _, child, _, path, _ = child_env
+    guardian, sid, expires_at, model = timed_session
+    _start(child, sid)
+    monkeypatch.setattr(time, "time", lambda: expires_at / 1000 + 1)
+    with closing(sqlite3.connect(path)) as db:
+        db.execute("""CREATE TRIGGER fail_logout BEFORE UPDATE OF revoked_at ON auth_sessions
+                      BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END""")
+    assert guardian.delete("/api/v1/auth/sessions/current",
+                           headers={"X-CSRF-Token": guardian.cookies["zhiya_csrf"]}).status_code == 503
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT status FROM reading_sessions WHERE id=?", (sid,)).fetchone() == ("IN_PROGRESS",)
+        assert db.execute("SELECT COUNT(*) FROM reading_reports WHERE session_id=?", (sid,)).fetchone() == (0,)
+    model.generate.assert_not_awaited()
+    assert guardian.get(f"/api/v1/reading-sessions/{sid}").status_code == 200
+    model.generate.assert_awaited_once()
+
+
+def test_expiry_read_recovers_after_startup_lock_without_health_probe(child_env, timed_session, monkeypatch):
+    _, child, _, path, _ = child_env
+    guardian, sid, expires_at, model = timed_session
+    _start(child, sid)
+    monkeypatch.setattr(time, "time", lambda: expires_at / 1000 + 1)
+    restarted = create_app(Settings(), SpeechSettings())
+    with closing(sqlite3.connect(path)) as lock:
+        lock.execute("BEGIN IMMEDIATE")
+        with TestClient(restarted, base_url="https://testserver") as client:
+            client.cookies.update(guardian.cookies)
+            monkeypatch.setattr(restarted.state, "model_adapter", model)
+            lock.rollback()
+            result = client.get(f"/api/v1/reading-sessions/{sid}")
+            assert result.status_code == 200
+            assert result.json()["data"]["session"]["status"] == "FINISHED"
+    model.generate.assert_awaited_once()

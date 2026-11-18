@@ -3,15 +3,13 @@
 import json
 import sqlite3
 import time
-from contextlib import closing
 from typing import Literal
 
 from fastapi import APIRouter, Path, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.api.v1.auth import Principal, authenticate_request, connect, error
+from app.api.v1.auth import authorized_db, error
 from app.services.cleanup import delete_session_rows, purge_voice_media
-from app.services.reading_reports import settle_expired_grants
 
 router = APIRouter(prefix="/api/v1/child-profiles")
 AgeBand = Literal["AGE_3_4", "AGE_4_5", "AGE_5_6"]
@@ -67,22 +65,6 @@ class ProfileUpdate(ProfileFields):
         return self
 
 
-def guardian_session(db, request: Request, *, write: bool, in_write_tx: bool = False) -> tuple[Principal | None, object]:
-    principal, failure = authenticate_request(db, request, write=write, in_write_tx=in_write_tx)
-    if failure:
-        return None, failure
-    if principal.role != "GUARDIAN":
-        return None, error(request, 403, "FORBIDDEN", "当前为儿童模式，仅限家长操作")
-    return principal, None
-
-
-def guardian(db, request: Request, *, write: bool, in_write_tx: bool = False):
-    principal, failure = guardian_session(db, request, write=write, in_write_tx=in_write_tx)
-    if failure:
-        return None, failure
-    return principal.guardian_id, None
-
-
 def serialize(row):
     return {
         "childProfileId": row["id"], "nickname": row["nickname"], "ageBand": row["age_band"],
@@ -93,12 +75,10 @@ def serialize(row):
 @router.get("")
 def list_profiles(request: Request):
     try:
-        settle_expired_grants(request)
-        with closing(connect()) as db:
-            owner, failure = guardian(db, request, write=False)
+        with authorized_db(request, guardian_only=True) as (db, principal, failure):
             if failure:
                 return failure
-            rows = db.execute("SELECT * FROM child_profiles WHERE guardian_id = ? ORDER BY id", (owner,))
+            rows = db.execute("SELECT * FROM child_profiles WHERE guardian_id = ? ORDER BY id", (principal.guardian_id,))
             return {"data": {"items": [serialize(row) for row in rows]}, "requestId": request.state.request_id}
     except sqlite3.Error:
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
@@ -107,11 +87,10 @@ def list_profiles(request: Request):
 @router.post("", status_code=201)
 def create_profile(payload: ProfileCreate, request: Request):
     try:
-        with closing(connect()) as db, db:
-            db.execute("BEGIN IMMEDIATE")
-            owner, failure = guardian(db, request, write=True, in_write_tx=True)
+        with authorized_db(request, write=True, guardian_only=True) as (db, principal, failure):
             if failure:
                 return failure
+            owner = principal.guardian_id
             now = int(time.time() * 1000)
             cursor = db.execute(
                 """INSERT INTO child_profiles
@@ -130,11 +109,10 @@ def create_profile(payload: ProfileCreate, request: Request):
 def update_profile(payload: ProfileUpdate, request: Request,
                    profile_id: int = Path(ge=1, le=9007199254740991)):
     try:
-        with closing(connect()) as db, db:
-            db.execute("BEGIN IMMEDIATE")
-            owner, failure = guardian(db, request, write=True, in_write_tx=True)
+        with authorized_db(request, write=True, guardian_only=True) as (db, principal, failure):
             if failure:
                 return failure
+            owner = principal.guardian_id
             row = db.execute(
                 "SELECT * FROM child_profiles WHERE id = ? AND guardian_id = ?", (profile_id, owner)
             ).fetchone()
@@ -160,11 +138,10 @@ def delete_profile(request: Request, profile_id: int = Path(ge=1, le=90071992547
     """API-007: delete a guardian-owned child profile and all associated sessions, grants and derived data."""
     session_ids: list[int] = []
     try:
-        with closing(connect()) as db, db:
-            db.execute("BEGIN IMMEDIATE")
-            owner, failure = guardian(db, request, write=True, in_write_tx=True)
+        with authorized_db(request, write=True, guardian_only=True, settle_guardian=False) as (db, principal, failure):
             if failure:
                 return failure
+            owner = principal.guardian_id
             row = db.execute(
                 "SELECT id FROM child_profiles WHERE id = ? AND guardian_id = ?", (profile_id, owner)
             ).fetchone()

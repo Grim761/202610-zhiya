@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import time
 from collections import defaultdict, deque
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal
@@ -17,7 +17,9 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.db.connection import connect
-from app.services.reading_reports import queue_deferred_reports, settle_expired_grants_in_tx
+from app.services.reading_reports import (
+    ensure_startup_recovered, queue_deferred_reports, settle_grant_sessions, unsettled_sessions,
+)
 
 router = APIRouter(prefix="/api/v1/auth")
 SESSION_COOKIE = "zhiya_session"
@@ -99,19 +101,11 @@ def set_session_cookies(response: Response, token: str, max_age: int) -> None:
                         httponly=False, samesite="lax", path="/")
 
 
-def authenticate_request(
-    db,
-    request: Request,
-    *,
-    write: bool,
-    allow_expired_child: bool = False,
-    in_write_tx: bool = False,
-):
-    """Authenticate either a live guardian auth_session or a child_grant."""
+def _identify(db, request: Request, *, csrf: bool, now: int):
+    """An expired child grant can still identify its owner for settlement and password unlock."""
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
         return None, error(request, 401, "AUTH_REQUIRED", "请先登录")
-    now = int(time.time() * 1000)
     digest = token_digest(token)
     guardian_row = db.execute(
         """SELECT s.id AS session_id, a.id AS account_id, a.role
@@ -122,7 +116,7 @@ def authenticate_request(
     if guardian_row:
         if guardian_row["role"] != "GUARDIAN":
             return None, error(request, 403, "FORBIDDEN", "当前账号不能执行此操作")
-        if write and not valid_csrf(request, token):
+        if csrf and not valid_csrf(request, token):
             return None, error(request, 403, "CSRF_INVALID", "请求校验失败")
         return Principal(guardian_id=guardian_row["account_id"], role="GUARDIAN",
                          auth_session_id=guardian_row["session_id"]), None
@@ -136,18 +130,49 @@ def authenticate_request(
         (digest, now),
     ).fetchone()
     if child_row:
-        if write and not valid_csrf(request, token):
+        if csrf and not valid_csrf(request, token):
             return None, error(request, 403, "CSRF_INVALID", "请求校验失败")
-        if child_row["expires_at"] <= now:
-            if in_write_tx:
-                pending = settle_expired_grants_in_tx(db, now=now, grant_id=child_row["grant_id"])
-                queue_deferred_reports(request, pending)
-            if not allow_expired_child:
-                return None, error(request, 401, "AUTH_REQUIRED", "请先登录")
         return Principal(guardian_id=child_row["guardian_id"], role="CHILD",
                          grant_id=child_row["grant_id"], profile_id=child_row["profile_id"],
                          grant_expires_at=child_row["expires_at"]), None
     return None, error(request, 401, "AUTH_REQUIRED", "请先登录")
+
+
+@contextmanager
+def authorized_db(request: Request, *, write: bool = False, csrf: bool = False,
+                  guardian_only: bool = False, allow_expired_child: bool = False,
+                  settle_guardian: bool = True):
+    """Keep authorization and business data in one snapshot; publish report jobs after commit."""
+    pending = []
+    with closing(connect()) as db, db:
+        db.execute("BEGIN")
+        now = int(time.time() * 1000)
+        principal, failure = _identify(db, request, csrf=write or csrf, now=now)
+        if principal and (write or unsettled_sessions(db, principal.guardian_id, principal.grant_id, now).fetchone()):
+            # Release the read snapshot before recovery acquires its own write lock.
+            db.rollback()
+            if not ensure_startup_recovered():
+                raise sqlite3.OperationalError("report recovery pending")
+            db.execute("BEGIN IMMEDIATE")
+            now = int(time.time() * 1000)
+            principal, failure = _identify(db, request, csrf=write or csrf, now=now)
+            if principal and (settle_guardian or principal.role == "CHILD"):
+                pending = settle_grant_sessions(db, principal.guardian_id, principal.grant_id, now)
+            if not write:
+                # A bookshelf or history read can be long. Only settlement needs the write lock.
+                db.commit()
+                queue_deferred_reports(request, pending)
+                pending = []
+                db.execute("BEGIN")
+                now = int(time.time() * 1000)
+                principal, failure = _identify(db, request, csrf=csrf, now=now)
+        if principal and principal.role == "CHILD":
+            if principal.grant_expires_at <= now and not allow_expired_child:
+                failure = error(request, 401, "AUTH_REQUIRED", "请先登录")
+            elif guardian_only:
+                failure = error(request, 403, "FORBIDDEN", "当前为儿童模式，仅限家长操作")
+        yield db, principal if failure is None else None, failure
+    queue_deferred_reports(request, pending)
 
 
 def revoke_grant_and_interrupt(db, grant_id: int, now: int) -> None:
@@ -195,11 +220,17 @@ def register(payload: Credentials, request: Request):
 @router.post("/sessions", status_code=201)
 def login(payload: Credentials, request: Request):
     client = request.client.host if request.client else "unknown"
-    if not allowed_login(client):
-        return error(request, 429, "RATE_LIMITED", "尝试次数过多，请稍后再试", retryable=True,
-                     headers={"Retry-After": str(LOGIN_WINDOW)})
     try:
         with closing(connect()) as db, db:
+            token = request.cookies.get(SESSION_COOKIE)
+            if token and db.execute(
+                "SELECT 1 FROM child_grants WHERE token_digest = ? AND revoked_at IS NULL",
+                (token_digest(token),),
+            ).fetchone():
+                return error(request, 403, "FORBIDDEN", "请先通过家长解锁退出儿童模式")
+            if not allowed_login(client):
+                return error(request, 429, "RATE_LIMITED", "尝试次数过多，请稍后再试", retryable=True,
+                             headers={"Retry-After": str(LOGIN_WINDOW)})
             account = db.execute(
                 "SELECT id, password_hash FROM accounts WHERE account = ?", (payload.account,)
             ).fetchone()
@@ -225,15 +256,12 @@ def login(payload: Credentials, request: Request):
 
 @router.delete("/sessions/current", status_code=204)
 def logout(request: Request):
-    now = int(time.time() * 1000)
     try:
-        with closing(connect()) as db, db:
-            db.execute("BEGIN IMMEDIATE")
-            principal, failure = authenticate_request(db, request, write=True, allow_expired_child=True, in_write_tx=True)
+        with authorized_db(request, write=True, allow_expired_child=True) as (db, principal, failure):
             if failure:
                 return failure
+            now = int(time.time() * 1000)
             if principal.role == "GUARDIAN":
-                queue_deferred_reports(request, settle_expired_grants_in_tx(db, now=now, guardian_id=principal.guardian_id))
                 db.execute("UPDATE auth_sessions SET revoked_at = ? WHERE id = ?",
                            (now, principal.auth_session_id))
                 grant_ids = [r[0] for r in db.execute(
@@ -258,11 +286,8 @@ def logout(request: Request):
 def parent_unlock(payload: Credentials, request: Request):
     """API-021: re-authenticate guardian to exit child mode, revoke grant and issue a fresh session."""
     client = request.client.host if request.client else "unknown"
-    now = int(time.time() * 1000)
     try:
-        with closing(connect()) as db, db:
-            db.execute("BEGIN IMMEDIATE")
-            principal, failure = authenticate_request(db, request, write=True, allow_expired_child=True, in_write_tx=True)
+        with authorized_db(request, write=True, allow_expired_child=True) as (db, principal, failure):
             if failure:
                 return failure
             if principal.role != "CHILD":
@@ -277,6 +302,7 @@ def parent_unlock(payload: Credentials, request: Request):
             if (not password_matches(payload.password, stored) or not account
                     or account["role"] != "GUARDIAN" or account["id"] != principal.guardian_id):
                 return error(request, 401, "INVALID_CREDENTIALS", "账号或密码错误")
+            now = int(time.time() * 1000)
             revoke_grant_and_interrupt(db, principal.grant_id, now)
             new_token = secrets.token_urlsafe(32)
             db.execute(
