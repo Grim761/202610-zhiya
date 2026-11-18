@@ -31,6 +31,8 @@ from app.services.reading_reports import (
 
 router = APIRouter(prefix="/api/v1/reading-sessions")
 MAX_ID = 9007199254740991
+MAX_ANSWER_LENGTH = 200
+CHILD_SHORT_ANSWERS = ("是", "不是", "不知道")
 
 
 class SessionCreate(BaseModel):
@@ -65,7 +67,7 @@ class ReadingEvent(BaseModel):
     @model_validator(mode="after")
     def validate_event_fields(self):
         if self.eventType == "ANSWER":
-            if self.inputText is None or not 1 <= len(self.inputText) <= 200 or self.feedback is not None:
+            if self.inputText is None or not 1 <= len(self.inputText) <= MAX_ANSWER_LENGTH or self.feedback is not None:
                 raise ValueError("ANSWER 事件需要 1～200 字符 inputText 且不可携带 feedback")
         elif self.eventType == "FEEDBACK":
             if self.feedback is None or self.inputText is not None:
@@ -87,6 +89,37 @@ class ModeSettings(BaseModel):
     mode: Literal["CHILD_SOLO"]
     allowedStoryVersionIds: list[Annotated[int, Field(ge=1, le=MAX_ID, strict=True)]] = Field(min_length=1, max_length=100)
     timeLimitSeconds: int = Field(ge=60, le=1800, strict=True)
+
+
+def current_question(db: sqlite3.Connection, session: sqlite3.Row) -> sqlite3.Row | None:
+    questions = db.execute(
+        """SELECT output_text, response_json FROM interaction_events
+           WHERE session_id = ? AND version_id = ? AND page_no = ? AND event_type = 'QUESTION'
+             AND result_status IN ('SUCCESS', 'FALLBACK') AND output_text IS NOT NULL
+           ORDER BY id DESC""",
+        (session["id"], session["version_id"], session["current_page_no"]),
+    )
+    return next((question for question in questions if question["output_text"].strip()), None)
+
+
+def child_answer_options(db: sqlite3.Connection, session: sqlite3.Row) -> list[str]:
+    question = current_question(db, session)
+    if question is None:
+        choices = db.execute(
+            """SELECT choice_label FROM story_branches
+               WHERE version_id = ? AND from_page_no = ? AND review_status = 'APPROVED' ORDER BY id""",
+            (session["version_id"], session["current_page_no"]),
+        )
+        options = (choice["choice_label"] for choice in choices)
+    else:
+        data = json.loads(question["response_json"]).get("data")
+        if not isinstance(data, dict) or "answerOptions" not in data:
+            return list(CHILD_SHORT_ANSWERS)
+        options = data["answerOptions"]
+        if not isinstance(options, list):
+            return []
+    labels = (option.strip() for option in options if isinstance(option, str))
+    return list(dict.fromkeys(label for label in labels if 1 <= len(label) <= MAX_ANSWER_LENGTH))
 
 
 def session_object(row):
@@ -182,10 +215,13 @@ def get_session(request: Request, session_id: int = Path(ge=1, le=MAX_ID)):
             if principal.role == "GUARDIAN":
                 report_row = db.execute("SELECT * FROM reading_reports WHERE session_id = ?", (session_id,)).fetchone()
                 report = report_object(session_id, report_row)
-            return {"data": {"session": session_object(row),
-                             "events": [{"interactionEventId": e["id"], "eventType": e["event_type"],
-                                         "pageNumber": e["page_no"]} for e in events],
-                             "report": report}, "requestId": request.state.request_id}
+            data = {"session": session_object(row),
+                    "events": [{"interactionEventId": e["id"], "eventType": e["event_type"],
+                                "pageNumber": e["page_no"]} for e in events],
+                    "report": report}
+            if principal.role == "CHILD" and row["status"] == "IN_PROGRESS":
+                data["answerOptions"] = child_answer_options(db, row)
+            return {"data": data, "requestId": request.state.request_id}
     except sqlite3.Error:
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
 
@@ -443,29 +479,15 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
             elif payload.eventType == "ANSWER":
                 valid = row["status"] == "IN_PROGRESS" and payload.pageNumber == row["current_page_no"]
                 next_page_no = row["current_page_no"]
-                if valid and principal.role == "CHILD":
-                    # API-015 only accepts text. Match it to a reviewed choice on the current page.
-                    choices = db.execute(
-                        """SELECT choice_label FROM story_branches
-                           WHERE version_id = ? AND from_page_no = ? AND review_status = 'APPROVED'""",
-                        (row["version_id"], payload.pageNumber),
-                    )
-                    if not any(choice["choice_label"].strip() == payload.inputText for choice in choices):
-                        return fail_session_event(db, request, principal.guardian_id, session_id, payload.clientEventId,
-                                                  digest, 422, "VALIDATION_ERROR", "请选择当前页已审核的回答选项")
+                if valid and principal.role == "CHILD" and payload.inputText not in child_answer_options(db, row):
+                    return fail_session_event(db, request, principal.guardian_id, session_id, payload.clientEventId,
+                                              digest, 422, "VALIDATION_ERROR", "请选择当前页已审核的回答选项")
             else:  # FEEDBACK
                 valid = row["status"] == "IN_PROGRESS" and payload.pageNumber == row["current_page_no"]
                 next_page_no = row["current_page_no"]
-                if valid:
-                    questions = db.execute(
-                        """SELECT output_text FROM interaction_events
-                           WHERE session_id = ? AND version_id = ? AND page_no = ? AND event_type = 'QUESTION'
-                             AND result_status IN ('SUCCESS', 'FALLBACK') AND output_text IS NOT NULL""",
-                        (session_id, row["version_id"], payload.pageNumber),
-                    )
-                    if not any(question["output_text"].strip() for question in questions):
-                        return fail_session_event(db, request, principal.guardian_id, session_id, payload.clientEventId,
-                                                  digest, 409, "PROMPT_REQUIRED", "当前页尚未有引导问题，无法提交反馈")
+                if valid and current_question(db, row) is None:
+                    return fail_session_event(db, request, principal.guardian_id, session_id, payload.clientEventId,
+                                              digest, 409, "PROMPT_REQUIRED", "当前页尚未有引导问题，无法提交反馈")
             if not valid:
                 return fail_session_event(db, request, principal.guardian_id, session_id, payload.clientEventId,
                                           digest, 409, "SESSION_CONFLICT", "当前状态或页面不允许此操作")

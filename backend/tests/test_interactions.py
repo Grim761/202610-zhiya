@@ -1,5 +1,6 @@
 """Tests for API-010 recommendations, API-015 ANSWER/FEEDBACK events, and API-018 branch selection."""
 
+import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -285,26 +286,31 @@ def test_answer_feedback_and_branch_choice_lifecycle(env):
         assert ans_row[0] == "小兔子帮了朋友"
 
 
-def test_child_mode_can_choose_branch_and_cannot_call_recommendations(env):
-    first, _, _ = env
+def enter_child_mode(first, version_id):
     headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
     profile = first.post("/api/v1/child-profiles", headers=headers,
                          json={"ageBand": "AGE_3_4", "preferredMinutes": 10}).json()["data"]
     sid = first.post("/api/v1/reading-sessions", headers=headers, json={
-        "childProfileId": profile["childProfileId"], "storyVersionId": 11, "mode": "PARENT_CHILD"
+        "childProfileId": profile["childProfileId"], "storyVersionId": version_id, "mode": "PARENT_CHILD"
     }).json()["data"]["readingSessionId"]
     assert first.put(f"/api/v1/reading-sessions/{sid}/mode-settings", headers=headers, json={
-        "mode": "CHILD_SOLO", "allowedStoryVersionIds": [11], "timeLimitSeconds": 600
+        "mode": "CHILD_SOLO", "allowedStoryVersionIds": [version_id], "timeLimitSeconds": 600
     }).status_code == 200
-    child_headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    return sid, profile["childProfileId"], {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+
+
+def test_child_mode_can_choose_branch_and_cannot_call_recommendations(env):
+    first, _, _ = env
+    sid, profile_id, child_headers = enter_child_mode(first, 11)
     assert first.post("/api/v1/recommendations", headers=child_headers,
-                      json={"childProfileId": profile["childProfileId"]}).status_code == 403
+                      json={"childProfileId": profile_id}).status_code == 403
     assert first.post(f"/api/v1/reading-sessions/{sid}/events", headers=child_headers, json={
         "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "cs"
     }).status_code == 201
     assert first.post(f"/api/v1/reading-sessions/{sid}/events", headers=child_headers, json={
         "eventType": "PAGE_CHANGED", "pageNumber": 2, "expectedRevision": 1, "clientEventId": "cp"
     }).status_code == 201
+    assert first.get(f"/api/v1/reading-sessions/{sid}").json()["data"]["answerOptions"] == ["走小桥"]
     events_url = f"/api/v1/reading-sessions/{sid}/events"
     answer = {"eventType": "ANSWER", "pageNumber": 2, "expectedRevision": 2}
     for index, label in enumerate(("未经审核的文本", "待审分支", "第一页分支")):
@@ -322,3 +328,62 @@ def test_child_mode_can_choose_branch_and_cannot_call_recommendations(env):
         "branchId": 501, "expectedRevision": 3, "clientEventId": "cb"
     })
     assert branch.status_code == 201 and branch.json()["data"]["currentPage"] == 4
+
+
+def save_question(path, sid, data, *, status="SUCCESS", text="你听到了什么？"):
+    # API-017 commits the displayed question and its response together with the new revision.
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("PRAGMA foreign_keys = ON")
+        version, page, revision = db.execute(
+            """UPDATE reading_sessions SET revision = revision + 1 WHERE id = ?
+               RETURNING version_id, current_page_no, revision""", (sid,)
+        ).fetchone()
+        db.execute("""INSERT INTO interaction_events
+            (session_id, version_id, request_key, request_digest, response_json, page_no, event_type,
+             output_text, result_status, revision_after, created_at)
+            VALUES (?, ?, ?, 'd', ?, ?, 'QUESTION', ?, ?, ?, 1)""",
+            (sid, version, f"question-{revision}", json.dumps({"data": data}), page, text, status, revision))
+    return revision
+
+
+def test_child_can_answer_a_question_on_a_linear_page(env):
+    first, _, path = env
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("UPDATE story_versions SET branching = 0 WHERE id = 21")
+    sid, _, headers = enter_child_mode(first, 21)
+    url = f"/api/v1/reading-sessions/{sid}"
+    assert first.post(url + "/events", headers=headers, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start"
+    }).status_code == 201
+    save_question(path, sid, {"answerOptions": ["风声"]})
+    save_question(path, sid, {"answerOptions": ["滴答滴答", "轰隆轰隆"]}, status="FALLBACK")
+    revision = save_question(path, sid, {"answerOptions": ["失效选项"]}, status="FAILED", text=None)
+    answer = {"eventType": "ANSWER", "pageNumber": 1, "expectedRevision": revision,
+              "clientEventId": "answer", "inputText": "滴答滴答"}
+    accepted = first.post(url + "/events", headers=headers, json=answer)
+    assert accepted.status_code == 201
+    assert accepted.json()["data"]["revision"] == revision + 1
+    assert first.get(url).json()["data"]["answerOptions"] == ["滴答滴答", "轰隆轰隆"]
+
+    for index, label in enumerate(("风声", "失效选项", "不是", "别的答案")):
+        refused = first.post(url + "/events", headers=headers, json={
+            **answer, "expectedRevision": revision + 1, "clientEventId": f"refused-{index}", "inputText": label
+        })
+        assert refused.status_code == 422 and refused.json()["error"]["code"] == "VALIDATION_ERROR"
+    progress = first.get(url).json()["data"]["session"]
+    assert (progress["currentPage"], progress["revision"]) == (1, revision + 1)
+    replay = first.post(url + "/events", headers=headers, json=answer)
+    assert replay.status_code == 200 and replay.json()["data"] == accepted.json()["data"]
+
+    assert first.post(url + "/events", headers=headers, json={
+        "eventType": "PAGE_CHANGED", "pageNumber": 2, "expectedRevision": revision + 1, "clientEventId": "page"
+    }).status_code == 201
+    assert first.get(url).json()["data"]["answerOptions"] == []
+    revision = save_question(path, sid, {})  # An older question with only a text prompt.
+    assert first.get(url).json()["data"]["answerOptions"] == ["是", "不是", "不知道"]
+    current = {**answer, "pageNumber": 2, "expectedRevision": revision}
+    assert first.post(url + "/events", headers=headers, json={**current, "clientEventId": "old-page"}).status_code == 422
+    short_answer = first.post(url + "/events", headers=headers, json={
+        **current, "clientEventId": "short", "inputText": " 不知道 "
+    })
+    assert short_answer.status_code == 201 and short_answer.json()["data"]["revision"] == revision + 1
