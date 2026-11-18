@@ -185,6 +185,28 @@ def test_missing_branch_replays_failure(started_session):
     assert chosen.json()["data"]["revision"] == 2
 
 
+def test_branch_replay_respects_retired_library_content_access(started_session):
+    first, headers, path, sid = started_session
+    session_url = f"/api/v1/reading-sessions/{sid}"
+    branch = {"branchId": 503, "expectedRevision": 1, "clientEventId": "branch"}
+    chosen = first.post(f"{session_url}/branches", headers=headers, json=branch)
+    assert chosen.status_code == 201
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("UPDATE story_versions SET status = 'RETIRED' WHERE id = 11")
+    assert first.get("/api/v1/story-versions/11").status_code == 200
+    replay = first.post(f"{session_url}/branches", headers=headers, json=branch)
+    assert replay.status_code == 200 and replay.json()["data"] == chosen.json()["data"]
+
+    finish = {"reason": "USER_FINISH", "expectedRevision": 2, "clientEventId": "end"}
+    assert first.post(f"{session_url}/completions", headers=headers, json=finish).status_code == 200
+    assert first.get("/api/v1/story-versions/11").status_code == 404
+    replay = first.post(f"{session_url}/branches", headers=headers, json=branch)
+    assert replay.status_code == 404 and replay.json()["error"]["code"] == "RESOURCE_NOT_FOUND"
+    history = first.get(session_url).json()["data"]
+    assert history["session"]["status"] == "FINISHED" and history["report"]["readingSessionId"] == sid
+    assert first.post(f"{session_url}/completions", headers=headers, json=finish).status_code == 200
+
+
 def test_answer_feedback_and_branch_choice_lifecycle(env):
     first, second, path = env
     headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
@@ -283,7 +305,20 @@ def test_child_mode_can_choose_branch_and_cannot_call_recommendations(env):
     assert first.post(f"/api/v1/reading-sessions/{sid}/events", headers=child_headers, json={
         "eventType": "PAGE_CHANGED", "pageNumber": 2, "expectedRevision": 1, "clientEventId": "cp"
     }).status_code == 201
+    events_url = f"/api/v1/reading-sessions/{sid}/events"
+    answer = {"eventType": "ANSWER", "pageNumber": 2, "expectedRevision": 2}
+    for index, label in enumerate(("未经审核的文本", "待审分支", "第一页分支")):
+        payload = {**answer, "clientEventId": f"answer-invalid-{index}", "inputText": label}
+        refused = first.post(events_url, headers=child_headers, json=payload)
+        assert refused.status_code == 422 and refused.json()["error"]["code"] == "VALIDATION_ERROR"
+        repeated = first.post(events_url, headers=child_headers, json=payload)
+        assert repeated.status_code == 422 and repeated.json()["error"] == refused.json()["error"]
+    assert first.get(f"/api/v1/reading-sessions/{sid}").json()["data"]["session"]["revision"] == 2
+    accepted = first.post(events_url, headers=child_headers, json={
+        **answer, "clientEventId": "answer-valid", "inputText": " 走小桥 "
+    })
+    assert accepted.status_code == 201 and accepted.json()["data"]["revision"] == 3
     branch = first.post(f"/api/v1/reading-sessions/{sid}/branches", headers=child_headers, json={
-        "branchId": 501, "expectedRevision": 2, "clientEventId": "cb"
+        "branchId": 501, "expectedRevision": 3, "clientEventId": "cb"
     })
     assert branch.status_code == 201 and branch.json()["data"]["currentPage"] == 4

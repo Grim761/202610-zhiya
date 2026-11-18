@@ -1620,7 +1620,7 @@
         "requestId": "req-demo"
       },
       "errors": "见 common.errors；只应用与本端点有关的错误类别",
-      "constraints": "类型STARTED/PAGE_CHANGED/ANSWER/FEEDBACK；SKIPPED是feedback取值，不是eventType。QUESTION、ASK、BRANCH_CHOSEN由对应服务写入；同键先重放，新键检查revision。",
+      "constraints": "类型STARTED/PAGE_CHANGED/ANSWER/FEEDBACK；SKIPPED是feedback取值，不是eventType。儿童ANSWER的inputText需匹配当前绘本版本和当前页的已审核选项文案，否则422 VALIDATION_ERROR；家长共读仍可提交文本。QUESTION、ASK、BRANCH_CHOSEN由对应服务写入；同键先重放，新键检查revision。",
       "interfaceId": "API-015",
       "uniqueKey": "POST /api/v1/reading-sessions/{session_id}/events"
     },
@@ -1757,7 +1757,7 @@
         "requestId": "req-demo"
       },
       "errors": "见 common.errors；只应用与本端点有关的错误类别",
-      "constraints": "分支属于当前故事和当前节点且已审核；原子提交进度及事件。重复相同请求200；标识复用且内容不同409。",
+      "constraints": "分支属于当前故事和当前节点且已审核；原子提交进度及事件。重复相同请求时，复核该正文版本的API-009读取权限，通过后返回200；正文不可读返回404。标识复用且内容不同409。",
       "interfaceId": "API-018",
       "uniqueKey": "POST /api/v1/reading-sessions/{session_id}/branches"
     },

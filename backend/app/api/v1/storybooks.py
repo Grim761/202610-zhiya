@@ -101,36 +101,39 @@ def list_storybooks(request: Request, age_band: AgeBand | None = Query(default=N
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
 
 
+def readable_story_version(db, principal, version_id: int):
+    """Apply the same live content permissions to detail and cached page responses."""
+    guardian = principal.guardian_id
+    child = principal.role == "CHILD"
+    grant_filter = (
+        "AND EXISTS (SELECT 1 FROM child_grant_books gb WHERE gb.grant_id = ? AND gb.version_id = v.id) "
+        if child else ""
+    )
+    active_session_filter = (
+        "EXISTS (SELECT 1 FROM reading_sessions s WHERE s.version_id = v.id AND s.grant_id = ? "
+        "AND s.profile_id = ? AND s.status IN ('CREATED', 'IN_PROGRESS'))"
+        if child else
+        "EXISTS (SELECT 1 FROM reading_sessions s JOIN child_profiles p ON p.id = s.profile_id "
+        "WHERE s.version_id = v.id AND p.guardian_id = ? AND s.status IN ('CREATED', 'IN_PROGRESS'))"
+    )
+    params = ((version_id, principal.grant_id, guardian, True, guardian, principal.grant_id, principal.profile_id)
+              if child else (version_id, guardian, True, guardian, guardian))
+    return db.execute(
+        "SELECT v.* FROM story_versions v JOIN storybooks b ON b.id = v.storybook_id "
+        f"WHERE v.id = ? {grant_filter}AND (" + VISIBLE +
+        " OR (v.status = 'RETIRED' AND v.reviewed_by_id IS NOT NULL AND v.reviewed_at IS NOT NULL "
+        f"AND b.source_type = 'LIBRARY' AND {active_session_filter}))",
+        params,
+    ).fetchone()
+
+
 @router.get("/story-versions/{version_id}")
 def get_story_version(request: Request, version_id: int = Path(ge=1, le=9007199254740991)):
     try:
         with authorized_db(request) as (db, principal, failure):
             if failure:
                 return failure
-            grant_filter = (
-                "AND EXISTS (SELECT 1 FROM child_grant_books gb WHERE gb.grant_id = ? AND gb.version_id = v.id) "
-                if principal.role == "CHILD" else ""
-            )
-            active_session_filter = (
-                "EXISTS (SELECT 1 FROM reading_sessions s WHERE s.version_id = v.id AND s.grant_id = ? "
-                "AND s.profile_id = ? AND s.status IN ('CREATED', 'IN_PROGRESS'))"
-                if principal.role == "CHILD"
-                else "EXISTS (SELECT 1 FROM reading_sessions s JOIN child_profiles p ON p.id = s.profile_id "
-                     "WHERE s.version_id = v.id AND p.guardian_id = ? AND s.status IN ('CREATED', 'IN_PROGRESS'))"
-            )
-            params = (
-                (version_id, principal.grant_id, principal.guardian_id, True, principal.guardian_id,
-                 principal.grant_id, principal.profile_id)
-                if principal.role == "CHILD"
-                else (version_id, principal.guardian_id, True, principal.guardian_id, principal.guardian_id)
-            )
-            row = db.execute(
-                "SELECT v.* FROM story_versions v JOIN storybooks b ON b.id = v.storybook_id "
-                f"WHERE v.id = ? {grant_filter}AND (" + VISIBLE +
-                " OR (v.status = 'RETIRED' AND v.reviewed_by_id IS NOT NULL AND v.reviewed_at IS NOT NULL "
-                f"AND b.source_type = 'LIBRARY' AND {active_session_filter}))",
-                params,
-            ).fetchone()
+            row = readable_story_version(db, principal, version_id)
             if not row:
                 return error(request, 404, "RESOURCE_NOT_FOUND", "绘本不可用")
             return {"data": version_object(db, row), "requestId": request.state.request_id}

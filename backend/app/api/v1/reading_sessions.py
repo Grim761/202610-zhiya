@@ -21,7 +21,7 @@ from app.api.v1.auth import (
     set_session_cookies,
     token_digest,
 )
-from app.api.v1.storybooks import VISIBLE, page_object
+from app.api.v1.storybooks import VISIBLE, page_object, readable_story_version
 from app.services.cleanup import delete_session_rows, purge_voice_media
 from app.services.reading_reports import (
     fact_summary,
@@ -352,7 +352,7 @@ def owned_session(db, session_id: int, principal: Principal):
 
 
 def replay_session_event(db, request: Request, session_id: int, client_event_id: str, digest: str,
-                         principal: Principal | None = None):
+                         principal: Principal | None = None, *, page_version_id: int | None = None):
     """Shared SESSION_EVENT lookup for events/completions (and later questions/guidance/branches).
 
     Returns a response when the key was already used, otherwise None.
@@ -378,6 +378,9 @@ def replay_session_event(db, request: Request, session_id: int, client_event_id:
         return error(request, 409, "REQUEST_IN_PROGRESS", "请求正在处理", retryable=True, headers={"Retry-After": "1"})
     if previous["status"] == "UNKNOWN":
         return error(request, 504, "REQUEST_OUTCOME_UNKNOWN", "请求结果未知，请先查询会话")
+    if (previous["status"] == "SUCCEEDED" and page_version_id is not None
+            and readable_story_version(db, principal, page_version_id) is None):
+        return error(request, 404, "RESOURCE_NOT_FOUND", "绘本不可用")
     body = json.loads(previous["response_body"])
     body["requestId"] = request.state.request_id
     if principal is not None and principal.role == "CHILD" and isinstance(body.get("data"), dict) and "report" in body["data"]:
@@ -440,6 +443,16 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
             elif payload.eventType == "ANSWER":
                 valid = row["status"] == "IN_PROGRESS" and payload.pageNumber == row["current_page_no"]
                 next_page_no = row["current_page_no"]
+                if valid and principal.role == "CHILD":
+                    # API-015 only accepts text. Match it to a reviewed choice on the current page.
+                    choices = db.execute(
+                        """SELECT choice_label FROM story_branches
+                           WHERE version_id = ? AND from_page_no = ? AND review_status = 'APPROVED'""",
+                        (row["version_id"], payload.pageNumber),
+                    )
+                    if not any(choice["choice_label"].strip() == payload.inputText for choice in choices):
+                        return fail_session_event(db, request, principal.guardian_id, session_id, payload.clientEventId,
+                                                  digest, 422, "VALIDATION_ERROR", "请选择当前页已审核的回答选项")
             else:  # FEEDBACK
                 valid = row["status"] == "IN_PROGRESS" and payload.pageNumber == row["current_page_no"]
                 next_page_no = row["current_page_no"]
@@ -486,7 +499,8 @@ def choose_branch(payload: BranchChoice, request: Request, session_id: int = Pat
             row = owned_session(db, session_id, principal)
             if not row:
                 return error(request, 404, "RESOURCE_NOT_FOUND", "会话不可用")
-            replay = replay_session_event(db, request, session_id, payload.clientEventId, digest, principal)
+            replay = replay_session_event(db, request, session_id, payload.clientEventId, digest, principal,
+                                          page_version_id=row["version_id"])
             if replay is not None:
                 return replay
             if row["status"] != "IN_PROGRESS" or row["revision"] != payload.expectedRevision:
