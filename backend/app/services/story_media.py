@@ -435,9 +435,12 @@ def _pinned_blob_is_readable(entry: object) -> bool:
         return True
 
 
-def ensure_opening_media(db: sqlite3.Connection, version: sqlite3.Row) -> None:
+def ensure_opening_media(db: sqlite3.Connection, version: sqlite3.Row, *, page_no: int = 1) -> None:
     manifest = pin_version_media(db, version)
-    for entry in (manifest["cover"], manifest["pages"].get("1")):
+    entries = [manifest["cover"], manifest["pages"].get("1")]
+    if page_no != 1:
+        entries.append(manifest["pages"].get(str(page_no)))
+    for entry in entries:
         if entry is not None and not _pinned_blob_is_readable(entry):
             raise MediaDependencyError("Pinned opening image is unavailable")
 

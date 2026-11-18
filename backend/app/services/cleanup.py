@@ -11,7 +11,14 @@ def delete_session_rows(db, session_id: int) -> None:
     )
     db.execute("DELETE FROM interaction_events WHERE session_id = ?", (session_id,))
     db.execute("DELETE FROM reading_reports WHERE session_id = ?", (session_id,))
-    db.execute("DELETE FROM request_executions WHERE session_id = ?", (session_id,))
+    db.execute(
+        """DELETE FROM request_executions
+           WHERE session_id = ?
+              OR (scope_type = 'SESSION_CREATE'
+                  AND (json_extract(response_body, '$.data.readingSessionId') = ?
+                       OR json_extract(response_body, '$.data.sourceReadingSessionId') = ?))""",
+        (session_id, session_id, session_id),
+    )
     # Clear continuation lineage on derived versions so deleting the source session does not violate FKs.
     db.execute(
         """UPDATE story_versions SET source_version_id = NULL, source_session_id = NULL,
