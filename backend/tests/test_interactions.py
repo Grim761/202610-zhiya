@@ -80,6 +80,111 @@ def test_recommendations_filter_age_interests_and_access(env):
     assert empty.status_code == 200 and empty.json()["data"]["items"] == []
 
 
+def test_recommendations_rank_all_eligible_versions_before_limiting(env):
+    first, _, path = env
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    profile = first.post("/api/v1/child-profiles", headers=headers, json={
+        "ageBand": "AGE_3_4", "preferredMinutes": 10, "interests": ["星星", "太空"]
+    }).json()["data"]
+    # The fixture already has two eligible books. The 51st is the only interest match.
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("PRAGMA foreign_keys = ON")
+        for book_id in range(100, 149):
+            topics = '["太空", "星星"]' if book_id == 148 else '[]'
+            db.execute("INSERT INTO storybooks (id, source_type, created_at) VALUES (?, 'LIBRARY', 1)", (book_id,))
+            db.execute("""INSERT INTO story_versions
+                (id, storybook_id, version_no, title, topics_json, age_min, age_max, license_note,
+                 status, reviewed_by_id, reviewed_at, created_at, branching)
+                VALUES (?, ?, 1, '绘本', ?, 3, 4, 'ok', 'PUBLISHED', 1, 1, 1, 0)""", (book_id, book_id, topics))
+            db.execute("INSERT INTO story_pages (version_id, page_no, body_text, image_ref) VALUES (?, 1, '第一页', 'none')",
+                       (book_id,))
+
+    response = first.post("/api/v1/recommendations", headers=headers, json={"childProfileId": profile["childProfileId"]})
+    assert response.status_code == 200
+    items = response.json()["data"]["items"]
+    assert [item["storyVersionId"] for item in items] == [148, 11, 21, *range(100, 107)]
+    assert items[0]["reason"] == "符合 3～4 岁 与兴趣「太空」"
+
+
+def test_recommendation_database_failure_is_retryable(env, monkeypatch):
+    first, _, path = env
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    monkeypatch.setenv("ZHIYA_DB_PATH", str(path.with_name("missing.sqlite3")))
+    response = first.post("/api/v1/recommendations", headers=headers, json={"childProfileId": 1})
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+    assert response.json()["error"]["retryable"] is True
+
+
+@pytest.fixture
+def started_session(env):
+    first, _, path = env
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    profile = first.post("/api/v1/child-profiles", headers=headers, json={
+        "ageBand": "AGE_3_4", "preferredMinutes": 10
+    }).json()["data"]
+    sid = first.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile["childProfileId"], "storyVersionId": 11, "mode": "PARENT_CHILD"
+    }).json()["data"]["readingSessionId"]
+    assert first.post(f"/api/v1/reading-sessions/{sid}/events", headers=headers, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start"
+    }).status_code == 201
+    return first, headers, path, sid
+
+
+@pytest.mark.parametrize(("status", "text", "accepted"), [
+    ("FAILED", None, False), ("FAILED", "问题生成受阻", False), ("SUCCESS", None, False),
+    ("SUCCESS", "", False), ("FALLBACK", " \t\n　", False), ("FALLBACK", "你看到了什么？", True),
+])
+def test_feedback_requires_a_displayable_question(started_session, status, text, accepted):
+    first, headers, path, sid = started_session
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("""INSERT INTO interaction_events
+            (session_id, version_id, request_key, request_digest, response_json, page_no,
+             event_type, output_text, result_status, revision_after, created_at)
+            VALUES (?, 11, 'question', 'd', '{}', 1, 'QUESTION', ?, ?, 1, 1)""", (sid, text, status))
+    response = first.post(f"/api/v1/reading-sessions/{sid}/events", headers=headers, json={
+        "eventType": "FEEDBACK", "pageNumber": 1, "expectedRevision": 1, "clientEventId": "feedback", "feedback": "UNDERSTOOD"
+    })
+    if accepted:
+        assert response.status_code == 201 and response.json()["data"]["revision"] == 2
+    else:
+        assert response.status_code == 409 and response.json()["error"]["code"] == "PROMPT_REQUIRED"
+        with closing(sqlite3.connect(path)) as db:
+            assert db.execute("SELECT revision FROM reading_sessions WHERE id = ?", (sid,)).fetchone()[0] == 1
+
+
+def test_branch_is_scoped_to_session_version(started_session):
+    first, headers, path, sid = started_session
+    url = f"/api/v1/reading-sessions/{sid}/branches"
+    # Version 21 also belongs to this guardian, but the session is reading version 11.
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("INSERT INTO story_branches VALUES (504, 21, 1, 3, '另一版本分支', 'APPROVED')")
+    outside = first.post(url, headers=headers, json={"branchId": 504, "expectedRevision": 1, "clientEventId": "other-version"})
+    missing = first.post(url, headers=headers, json={"branchId": 999, "expectedRevision": 1, "clientEventId": "missing"})
+    assert outside.status_code == missing.status_code == 404
+    assert outside.json()["error"] == missing.json()["error"]
+    assert outside.json()["error"]["code"] == "RESOURCE_NOT_FOUND"
+
+
+def test_missing_branch_replays_failure(started_session):
+    first, headers, path, sid = started_session
+    url = f"/api/v1/reading-sessions/{sid}/branches"
+    payload = {"branchId": 700, "expectedRevision": 1, "clientEventId": "choice"}
+    original = first.post(url, headers=headers, json=payload)
+    assert original.status_code == 404
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("INSERT INTO story_branches VALUES (700, 11, 1, 4, '后来添加的分支', 'APPROVED')")
+    replay = first.post(url, headers=headers, json=payload)
+    assert replay.status_code == 404 and replay.json()["error"] == original.json()["error"]
+    assert replay.json()["requestId"] == replay.headers["X-Request-ID"] != original.json()["requestId"]
+    conflict = first.post(url, headers=headers, json={**payload, "branchId": 503})
+    assert conflict.status_code == 409 and conflict.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    chosen = first.post(url, headers=headers, json={**payload, "clientEventId": "new-choice"})
+    assert chosen.status_code == 201 and chosen.json()["data"]["visitedPageNumbers"] == [1, 4]
+    assert chosen.json()["data"]["revision"] == 2
+
+
 def test_answer_feedback_and_branch_choice_lifecycle(env):
     first, second, path = env
     headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}

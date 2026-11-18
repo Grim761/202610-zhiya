@@ -1,6 +1,5 @@
 """Read-only bookshelf for guardians and scoped child grants."""
 
-import json
 import sqlite3
 from typing import Literal
 
@@ -164,28 +163,25 @@ def recommend_storybooks(payload: RecommendationRequest, request: Request):
                 conditions.append("EXISTS (SELECT 1 FROM json_each(v.topics_json) WHERE value = ?)")
                 params.append(payload.topic)
             rows = db.execute(
-                "SELECT v.* FROM story_versions v JOIN storybooks b ON b.id = v.storybook_id WHERE "
+                """SELECT v.id,
+                          (SELECT topic.value FROM json_each(v.topics_json) AS topic
+                           WHERE topic.value IN (SELECT value FROM json_each(?))
+                           ORDER BY topic.key LIMIT 1) AS matched_interest
+                   FROM story_versions v JOIN storybooks b ON b.id = v.storybook_id WHERE """
                 + " AND ".join(conditions)
-                + " ORDER BY v.storybook_id, v.version_no DESC LIMIT 50",
-                params,
+                + " ORDER BY matched_interest IS NULL, v.storybook_id, v.version_no DESC LIMIT 10",
+                (profile["interests_json"], *params),
             ).fetchall()
-            interests = set(json.loads(profile["interests_json"]))
-            scored = []
-            for row in rows:
-                topics = json.loads(row["topics_json"])
-                matched = [t for t in topics if t in interests]
-                scored.append((0 if matched else 1, row["storybook_id"], row, matched))
-            scored.sort(key=lambda item: (item[0], item[1]))
             age_label = AGE_LABELS[profile["age_band"]]
             items = []
-            for _, _, row, matched in scored[:10]:
+            for row in rows:
                 if payload.topic is not None:
                     reason = f"符合 {age_label} 与主题「{payload.topic}」"
-                elif matched:
-                    reason = f"符合 {age_label} 与兴趣「{matched[0]}」"
+                elif row["matched_interest"] is not None:
+                    reason = f"符合 {age_label} 与兴趣「{row['matched_interest']}」"
                 else:
                     reason = f"适合 {age_label} 共读"
                 items.append({"storyVersionId": row["id"], "reason": reason, "sources": []})
             return {"data": {"items": items}, "requestId": request.state.request_id}
     except sqlite3.Error:
-        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
+        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)

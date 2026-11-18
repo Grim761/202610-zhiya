@@ -444,12 +444,13 @@ def add_reading_event(payload: ReadingEvent, request: Request, session_id: int =
                 valid = row["status"] == "IN_PROGRESS" and payload.pageNumber == row["current_page_no"]
                 next_page_no = row["current_page_no"]
                 if valid:
-                    has_question = db.execute(
-                        """SELECT 1 FROM interaction_events
-                           WHERE session_id = ? AND version_id = ? AND page_no = ? AND event_type = 'QUESTION'""",
+                    questions = db.execute(
+                        """SELECT output_text FROM interaction_events
+                           WHERE session_id = ? AND version_id = ? AND page_no = ? AND event_type = 'QUESTION'
+                             AND result_status IN ('SUCCESS', 'FALLBACK') AND output_text IS NOT NULL""",
                         (session_id, row["version_id"], payload.pageNumber),
-                    ).fetchone()
-                    if not has_question:
+                    )
+                    if not any(question["output_text"].strip() for question in questions):
                         return fail_session_event(db, request, principal.guardian_id, session_id, payload.clientEventId,
                                                   digest, 409, "PROMPT_REQUIRED", "当前页尚未有引导问题，无法提交反馈")
             if not valid:
@@ -492,13 +493,14 @@ def choose_branch(payload: BranchChoice, request: Request, session_id: int = Pat
                 return fail_session_event(db, request, principal.guardian_id, session_id, payload.clientEventId,
                                           digest, 409, "SESSION_CONFLICT", "会话状态或进度已变化")
             branch = db.execute(
-                "SELECT id, version_id, from_page_no, next_page_no, review_status FROM story_branches WHERE id = ?",
-                (payload.branchId,),
+                """SELECT from_page_no, next_page_no, review_status FROM story_branches
+                   WHERE id = ? AND version_id = ?""",
+                (payload.branchId, row["version_id"]),
             ).fetchone()
             if not branch:
-                return error(request, 404, "RESOURCE_NOT_FOUND", "分支不存在")
-            if (branch["version_id"] != row["version_id"] or branch["from_page_no"] != row["current_page_no"]
-                    or branch["review_status"] != "APPROVED"):
+                return fail_session_event(db, request, principal.guardian_id, session_id, payload.clientEventId,
+                                          digest, 404, "RESOURCE_NOT_FOUND", "分支不存在")
+            if branch["from_page_no"] != row["current_page_no"] or branch["review_status"] != "APPROVED":
                 return fail_session_event(db, request, principal.guardian_id, session_id, payload.clientEventId,
                                           digest, 409, "SESSION_CONFLICT", "当前页面或审核状态不允许选择该分支")
             next_page = db.execute(
@@ -506,7 +508,8 @@ def choose_branch(payload: BranchChoice, request: Request, session_id: int = Pat
                 (row["version_id"], branch["next_page_no"]),
             ).fetchone()
             if not next_page:
-                return error(request, 404, "RESOURCE_NOT_FOUND", "目标页面不可用")
+                return fail_session_event(db, request, principal.guardian_id, session_id, payload.clientEventId,
+                                          digest, 404, "RESOURCE_NOT_FOUND", "目标页面不可用")
             now = int(time.time() * 1000)
             revision = row["revision"] + 1
             visited = json.loads(row["visited_pages_json"])
