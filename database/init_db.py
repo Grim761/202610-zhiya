@@ -1,6 +1,7 @@
 """Initialize and check the development database."""
 import argparse
 import os
+import shutil
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -22,10 +23,14 @@ def connect(path: Path, *, create: bool = False) -> sqlite3.Connection:
 
 
 def initialize(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with closing(connect(path, create=True)) as db, db:
+    resolved = path.resolve()
+    is_new_db = not resolved.exists()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    with closing(connect(resolved, create=True)) as db, db:
         db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA.read_text(encoding="utf-8"))
         check_foreign_keys(db)
+    if is_new_db:
+        shutil.rmtree(resolved.parent / f".{resolved.name}.media_pins", ignore_errors=True)
 
 
 def check_foreign_keys(db: sqlite3.Connection) -> None:

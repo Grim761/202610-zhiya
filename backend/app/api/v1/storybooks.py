@@ -7,7 +7,14 @@ from fastapi import APIRouter, Path, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.api.v1.auth import Principal, authorized_db, error
-from app.services.story_media import MediaDependencyError, cover_ref_for, page_image_ref_for
+from app.services.story_media import (
+    MediaDependencyError,
+    cover_ref_from_manifest,
+    ensure_media_dependencies,
+    page_image_ref_for,
+    page_image_ref_from_manifest,
+    pin_version_media,
+)
 
 router = APIRouter(prefix="/api/v1")
 MAX_ID = 9007199254740991
@@ -16,11 +23,16 @@ AGES = {"AGE_3_4": (3, 4), "AGE_4_5": (4, 5), "AGE_5_6": (5, 6)}
 AGE_LABELS = {"AGE_3_4": "3～4 岁", "AGE_4_5": "4～5 岁", "AGE_5_6": "5～6 岁"}
 
 
-def page_object(page_row) -> dict:
+def page_object(db: sqlite3.Connection, page_row, *, manifest: dict | None = None) -> dict:
+    image_ref = (
+        page_image_ref_from_manifest(page_row["version_id"], page_row["page_no"], manifest)
+        if manifest is not None
+        else page_image_ref_for(db, page_row["version_id"], page_row["page_no"])
+    )
     return {
         "pageNumber": page_row["page_no"],
         "text": page_row["body_text"],
-        "imageRef": page_image_ref_for(page_row["version_id"], page_row["page_no"], page_row["image_ref"]),
+        "imageRef": image_ref,
         "defaultNextPageNumber": page_row["default_next_page_number"],
     }
 
@@ -36,11 +48,12 @@ def version_object(db, row):
     source_type = row["storybook_source_type"] if "storybook_source_type" in row.keys() else (
         db.execute("SELECT source_type FROM storybooks WHERE id = ?", (row["storybook_id"],)).fetchone()["source_type"]
     )
+    manifest = pin_version_media(db, row, source_type=source_type, pages=pages)
     return {
         "storybookId": row["storybook_id"], "storyVersionId": row["id"],
         "versionNumber": row["version_no"], "title": row["title"], "status": row["status"],
-        "coverRef": cover_ref_for(row["storybook_id"], row["id"], row["version_no"], source_type, row["source_ref"]),
-        "pages": [page_object(p) for p in pages],
+        "coverRef": cover_ref_from_manifest(row["id"], manifest),
+        "pages": [page_object(db, p, manifest=manifest) for p in pages],
         "branches": [{"branchId": b["id"], "fromPageNumber": b["from_page_no"],
                       "nextPageNumber": b["next_page_no"], "choiceLabel": b["choice_label"],
                       "reviewStatus": b["review_status"]} for b in branches],
@@ -99,6 +112,7 @@ def list_storybooks(request: Request, age_band: AgeBand | None = Query(default=N
                 + " AND ".join(conditions) + " ORDER BY v.storybook_id, v.version_no DESC LIMIT ? OFFSET ?",
                 (*params, page_size, offset),
             ).fetchall()
+            ensure_media_dependencies()
             items = [version_object(db, row) for row in rows]
             return {"data": {"items": items, "page": page, "pageSize": page_size}, "requestId": request.state.request_id}
     except (sqlite3.Error, MediaDependencyError):

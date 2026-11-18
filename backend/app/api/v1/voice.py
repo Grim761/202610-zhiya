@@ -18,14 +18,7 @@ from app.api.v1.storybooks import readable_story_version
 from app.audio_conversion import MAX_UPLOAD_BYTES, normalize_recording
 from app.errors import ServiceError
 from app.schemas.voice import PageVoiceRequest, SynthesisRequest
-from app.services.story_media import (
-    SNIFF_BYTES,
-    MediaDependencyError,
-    detect_image_type,
-    parse_asset_key,
-    resolve_cover_asset,
-    resolve_page_asset,
-)
+from app.services.story_media import MediaDependencyError, parse_asset_key, read_pinned_asset_bytes
 from app.services.voice_access import VoicePrincipal, read_voice_source, recheck_source
 
 router = APIRouter(prefix="/api/v1")
@@ -176,28 +169,10 @@ def _read_story_image(request: Request, version_id: int, page_no: int | None) ->
             version = readable_story_version(db, principal, version_id)
             if not version:
                 raise ServiceError("RESOURCE_NOT_FOUND", "请求的资源不存在", 404)
-            if page_no is None:
-                resolved = resolve_cover_asset(version["storybook_id"], version["version_no"],
-                                               version["storybook_source_type"], version["source_ref"])
-            else:
-                page = db.execute(
-                    "SELECT image_ref FROM story_pages WHERE version_id = ? AND page_no = ?",
-                    (version_id, page_no),
-                ).fetchone()
-                resolved = resolve_page_asset(page["image_ref"]) if page else None
-            if resolved is None:
+            asset = read_pinned_asset_bytes(db, version, page_no)
+            if asset is None:
                 raise ServiceError("RESOURCE_NOT_FOUND", "请求的资源不存在", 404)
-            path, _ = resolved
-            try:
-                data = path.read_bytes()
-            except FileNotFoundError:
-                raise ServiceError("RESOURCE_NOT_FOUND", "请求的资源不存在", 404) from None
-            except OSError as exc:
-                raise _unavailable_read() from exc
-            # The response type follows the bytes actually served, never the file extension.
-            media_type = detect_image_type(data[:SNIFF_BYTES])
-            if media_type is None:
-                raise ServiceError("RESOURCE_NOT_FOUND", "请求的资源不存在", 404)
+            data, media_type = asset
             return Response(data, media_type=media_type, headers={
                 "Cache-Control": "private, no-store",
                 "X-Content-Type-Options": "nosniff",

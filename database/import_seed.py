@@ -1,11 +1,18 @@
 """Import the repository's draft seed data in a single transaction."""
 import json
 import sqlite3
+import sys
 from contextlib import closing
 from pathlib import Path
 from time import time_ns
 
 from init_db import ROOT, SEED_TABLES, check_foreign_keys, connect, database_path
+
+BACKEND_ROOT = ROOT.parent / "backend"
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+from app.services.story_media import clear_pin_store, pin_database_versions  # noqa: E402
 
 SEED_DIR = ROOT.parent / "data" / "seed"
 IDENTITIES = {
@@ -84,6 +91,8 @@ def import_seed(path: Path, seed_dir: Path = SEED_DIR) -> bool:
                 data[table],
             )
         check_foreign_keys(db)
+        clear_pin_store(path)
+        pin_database_versions(db, db_path=path)
         return True
 
 
