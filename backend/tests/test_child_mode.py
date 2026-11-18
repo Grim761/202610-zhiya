@@ -87,13 +87,14 @@ def test_enter_child_mode_scopes_access_voice_and_parent_unlock(child_env, monke
             "mode": "CHILD_SOLO", "allowedStoryVersionIds": [11, bad_vid], "timeLimitSeconds": 600
         }).status_code == 404
 
-    # Enter CHILD_SOLO granting 11 (PUBLISHED) and 31 (owned reviewed ORIGINAL RETIRED).
+    # Grant a published book and both the retired and current versions of one private book.
+    granted_versions = [11, 31, 32]
     res = first.put(mode_url, headers=guardian_headers, json={
-        "mode": "CHILD_SOLO", "allowedStoryVersionIds": [11, 31], "timeLimitSeconds": 600
+        "mode": "CHILD_SOLO", "allowedStoryVersionIds": granted_versions, "timeLimitSeconds": 600
     })
     assert res.status_code == 200 and res.json()["requestId"] == res.headers["X-Request-ID"]
     data = res.json()["data"]
-    assert data["mode"] == "CHILD_SOLO" and data["allowedStoryVersionIds"] == [11, 31]
+    assert data["mode"] == "CHILD_SOLO" and data["allowedStoryVersionIds"] == granted_versions
     assert data["expiresAt"].endswith("Z")
     child_token = first.cookies["zhiya_session"]
     child_headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
@@ -124,10 +125,13 @@ def test_enter_child_mode_scopes_access_voice_and_parent_unlock(child_env, monke
     }).status_code == 403
     assert first.get("/api/v1/storybooks", params={"scope": "mine"}).status_code == 403
 
-    # Child bookshelf and version details are scoped to allowedStoryVersionIds.
-    shelf_ids = [b["storyVersionId"] for b in first.get("/api/v1/storybooks").json()["data"]["items"]]
-    assert shelf_ids == [11, 31]
-    assert first.get("/api/v1/story-versions/31").status_code == 200
+    # The default shelf lists current granted versions. An explicitly granted retired version is readable by ID.
+    shelf = first.get("/api/v1/storybooks")
+    assert shelf.status_code == 200
+    assert [b["storyVersionId"] for b in shelf.json()["data"]["items"]] == [11, 32]
+    retired = first.get("/api/v1/story-versions/31")
+    assert retired.status_code == 200
+    assert retired.json()["data"]["storyVersionId"] == 31
     assert first.get("/api/v1/story-versions/12").status_code == 404  # PUBLISHED but not granted
 
     # Child can read/advance bound session, cannot read sibling session, and report stays null.

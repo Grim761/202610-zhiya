@@ -54,7 +54,7 @@ def list_storybooks(request: Request, age_band: AgeBand | None = Query(default=N
             if principal.role == "CHILD" and scope == "mine":
                 return error(request, 403, "FORBIDDEN", "儿童模式不支持查看个人历史书架")
             conditions = [VISIBLE]
-            params = [principal.guardian_id, scope == "mine" or principal.role == "CHILD", principal.guardian_id]
+            params = [principal.guardian_id, scope == "mine", principal.guardian_id]
             if principal.role == "CHILD":
                 conditions.append("EXISTS (SELECT 1 FROM child_grant_books gb WHERE gb.grant_id = ? AND gb.version_id = v.id)")
                 params.append(principal.grant_id)
