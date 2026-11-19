@@ -703,6 +703,73 @@ def test_seed_draft_picks_up_pages_added_before_publication(media_env, monkeypat
         assert client.get("/api/v1/media/" + key).content == PNG_BLUE
 
 
+@pytest.mark.parametrize(("initial_seed_cover", "source", "legacy"), [
+    pytest.param(False, "Editorial collection", False, id="complete-source"),
+    pytest.param(True, "Editorial collection", False, id="drop-seed-cover"),
+    pytest.param(False, SEED_COVER_SOURCE_REF, False, id="reserve-new-seed-cover"),
+    pytest.param(True, "Editorial collection", True, id="old-draft-changes-source"),
+])
+def test_draft_source_change_rechecks_cover_before_publication(media_env, monkeypatch,
+                                                               initial_seed_cover, source, legacy):
+    client, _, db_path, root = media_env
+    monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(root))
+    mapping = root / "covers.json"
+    mapping.write_text(json.dumps([{"storybook_id": 2, "cover_path": "cover.png"}]), encoding="utf-8")
+    monkeypatch.setenv("ZHIYA_COVER_MAPPING_PATH", str(mapping))
+    cover = root / "cover.png"
+    cover.write_bytes(PNG_BLUE)
+    _library_book(db_path, 20, 2, 1, ["/assets/placeholder.png"], status="DRAFT", seed_cover=initial_seed_cover)
+    with closing(sqlite3.connect(db_path)) as db:
+        story_media.pin_database_versions(db, db_path=db_path)
+        if legacy:
+            store = root / f".{db_path.name}.media_pins"
+            (store / "versions" / "20.draft.json").rename(store / "versions" / "20.json")
+            bindings = store.with_name(store.name + ".bindings")
+            (bindings / "20.draft.sha256").rename(bindings / "20.sha256")
+        cover.write_bytes(PNG_RED)
+        (root / "page.png").write_bytes(PNG_BLUE)
+        with db:
+            db.execute("UPDATE story_versions SET source_ref=? WHERE id=20", (source,))
+            db.execute("UPDATE story_pages SET image_ref='page.png' WHERE version_id=20")
+        story_media.pin_database_versions(db, db_path=db_path)
+        cover.write_bytes(PNG_BLUE)
+        with db:
+            db.execute("UPDATE story_versions SET status='PUBLISHED', reviewed_by_id=1, reviewed_at=2 WHERE id=20")
+        story_media.pin_database_versions(db, db_path=db_path)
+
+    book = client.get("/api/v1/story-versions/20").json()["data"]
+    assert client.get("/api/v1/storybooks").json()["data"]["items"] == [book]
+    assert book["pages"][0]["imageRef"] == "asset-20-page-1"
+    assert client.get("/api/v1/media/asset-20-page-1").content == PNG_BLUE
+    image = client.get("/api/v1/media/asset-20-cover")
+    if source == SEED_COVER_SOURCE_REF:
+        assert book["coverRef"] == "asset-20-cover" and image.content == PNG_RED
+    else:
+        assert book["coverRef"] is None and image.status_code == 404
+    _create_reading_session(client, 20)
+
+
+@pytest.mark.parametrize("release", [False, True], ids=["draft-version-number", "released-source"])
+def test_draft_source_edits_preserve_snapshot_identity_checks(media_env, monkeypatch, release):
+    _, _, db_path, root = media_env
+    monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(root))
+    mapping = root / "covers.json"
+    mapping.write_text("[]", encoding="utf-8")
+    monkeypatch.setenv("ZHIYA_COVER_MAPPING_PATH", str(mapping))
+    _library_book(db_path, 20, 2, 1, ["none"], status="DRAFT", seed_cover=False)
+    with closing(sqlite3.connect(db_path)) as db:
+        story_media.pin_database_versions(db, db_path=db_path)
+        if release:
+            with db:
+                db.execute("UPDATE story_versions SET status='PUBLISHED', reviewed_by_id=1, reviewed_at=2 WHERE id=20")
+            story_media.pin_database_versions(db, db_path=db_path)
+            db.execute("UPDATE story_versions SET source_ref='changed after publication' WHERE id=20")
+        else:
+            db.execute("UPDATE story_versions SET version_no=2, source_ref='new source' WHERE id=20")
+        with pytest.raises(story_media.MediaDependencyError, match="Invalid version media snapshot"):
+            story_media.pin_database_versions(db, db_path=db_path)
+
+
 def test_upgrade_nonseed_library_with_an_existing_session(media_env, monkeypatch):
     first, _, db_path, root = media_env
     monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(root))

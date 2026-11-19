@@ -265,7 +265,8 @@ def _manifest_paths(store: Path, name: str) -> tuple[Path, Path]:
     return store / "versions" / f"{name}.json", bindings / f"{name}.sha256"
 
 
-def _load_version_manifest(meta_path: Path, binding_path: Path, expected_identity: dict) -> dict | None:
+def _load_version_manifest(meta_path: Path, binding_path: Path, expected_identity: dict, *,
+                           draft: bool = False) -> dict | None:
     try:
         binding = binding_path.read_bytes()
     except FileNotFoundError:
@@ -283,8 +284,15 @@ def _load_version_manifest(meta_path: Path, binding_path: Path, expected_identit
         data = json.loads(raw)
     except ValueError as exc:
         raise MediaDependencyError("Invalid version media snapshot") from exc
-    if (not isinstance(data, dict) or data.get("identity") != expected_identity or "cover" not in data
-            or not isinstance(data.get("pages"), dict)):
+    if not isinstance(data, dict) or "cover" not in data or not isinstance(data.get("pages"), dict):
+        raise MediaDependencyError("Invalid version media snapshot")
+    recorded = data.get("identity")
+    if draft and isinstance(recorded, dict):
+        # Keep the original cover provenance when an editor changes the draft's source.
+        source_ref = recorded.get("sourceRef")
+        if source_ref is None or isinstance(source_ref, str):
+            expected_identity = {**expected_identity, "sourceRef": source_ref}
+    if recorded != expected_identity:
         raise MediaDependencyError("Invalid version media snapshot")
     if binding is None:
         # Adopt complete manifests from the previous layout without consulting mutable source files.
@@ -320,6 +328,7 @@ def pin_version_media(db: sqlite3.Connection, version_row: sqlite3.Row | dict, *
             src_type = cur.execute("SELECT source_type FROM storybooks WHERE id = ?", (storybook_id,)).fetchone()[0]
     identity = _identity_for_row(version_row, src_type)
     draft = version_row["status"] in ("DRAFT", "CHECK_FAILED", "PENDING_REVIEW")
+    has_seed_cover = src_type == "LIBRARY" and version_row["source_ref"] == SEED_COVER_SOURCE_REF
     try:
         store_root = _pin_store_root(db_path)
         original_paths = _manifest_paths(store_root, str(version_id))
@@ -331,17 +340,30 @@ def pin_version_media(db: sqlite3.Connection, version_row: sqlite3.Row | dict, *
                 released = _load_version_manifest(*released_paths, identity)
                 if released is not None:
                     return released
-            staged = _load_version_manifest(*draft_paths, identity)
+            staged = _load_version_manifest(*draft_paths, identity, draft=True)
+            if staged is not None and staged["identity"] != identity and has_seed_cover:
+                # A previously non-seed draft can reserve a seed cover without overwriting its old receipt.
+                draft_paths = _manifest_paths(store_root, f"{version_id}.draft-seed")
+                seed_manifest = _load_version_manifest(*draft_paths, identity)
+                if seed_manifest is not None:
+                    staged = seed_manifest
             if draft and staged is not None:
-                return staged
-            original = None if staged is not None else _load_version_manifest(*original_paths, identity)
+                if staged["identity"] == identity:
+                    return staged
+                if not has_seed_cover:
+                    return {"identity": identity, "cover": None, "pages": {}}
+            original = None
+            if staged is None:
+                original = _load_version_manifest(*original_paths, identity, draft=draft)
             if not draft and original is not None:
                 return original
 
             # On upgrade, an old manifest seen while still DRAFT can supply its cover, never its pages.
             # An already released legacy version keeps its original manifest byte for byte.
             previous = original if draft else staged
-            cover = previous.get("cover") if previous is not None else None
+            cover = None
+            if has_seed_cover and previous is not None and previous["identity"] == identity:
+                cover = previous["cover"]
             if draft:
                 meta_path, binding_path = draft_paths
                 pages = []
@@ -350,7 +372,6 @@ def pin_version_media(db: sqlite3.Connection, version_row: sqlite3.Row | dict, *
             if pages is None:
                 pages = cur.execute("SELECT page_no, image_ref FROM story_pages WHERE version_id = ? ORDER BY page_no",
                                     (version_id,)).fetchall()
-            has_seed_cover = src_type == "LIBRARY" and version_row["source_ref"] == SEED_COVER_SOURCE_REF
             # Older sessions may predate binding receipts. Text-only versions have no image to rebind.
             if not backfill and (has_seed_cover or any(_image_path_parts(p["image_ref"]) for p in pages)):
                 if cur.execute("SELECT 1 FROM reading_sessions WHERE version_id = ? LIMIT 1", (version_id,)).fetchone():
