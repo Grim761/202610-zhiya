@@ -5,6 +5,7 @@ import json
 import shutil
 import sqlite3
 import struct
+import subprocess
 import sys
 import zlib
 from contextlib import closing
@@ -472,7 +473,7 @@ def test_missing_page_stays_missing_when_a_new_version_reuses_its_path(media_env
     assert first.get("/api/v1/media/asset-20-page-1").status_code == 404
 
 
-@pytest.mark.parametrize("missing", ["versions", "store"])
+@pytest.mark.parametrize("missing", ["versions", "store", "legacy"])
 def test_bound_version_waits_for_original_snapshot(media_env, monkeypatch, missing):
     first, _, db_path, root = media_env
     monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(root))
@@ -491,7 +492,9 @@ def test_bound_version_waits_for_original_snapshot(media_env, monkeypatch, missi
     assert first.get("/api/v1/media/asset-21-cover").content == PNG_BLUE
 
     store = db_path.parent / f".{db_path.name}.media_pins"
-    unavailable = store / "versions" if missing == "versions" else store
+    if missing == "legacy":
+        (store.with_name(store.name + ".bindings") / "20.sha256").unlink()
+    unavailable = store if missing == "store" else store / "versions"
     backup = unavailable.rename(root / "offline")
     for url in ("/api/v1/media/asset-20-cover", "/api/v1/story-versions/20", "/api/v1/storybooks"):
         response = first.get(url)
@@ -604,6 +607,24 @@ def test_import_seed_pins_cover_assets_before_mapping_changes(tmp_path, monkeypa
         expected = (REPO_ROOT / "knowledge-base_v2.5" / "图片" / "PIC-B01_小狐狸的雨伞.png").read_bytes()
         assert resp.status_code == 200 and resp.content == expected
     _login_attempts.clear()
+
+
+def test_upgrade_nonseed_library_with_an_existing_session(media_env, monkeypatch):
+    first, _, db_path, root = media_env
+    monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(root))
+    (root / "page.png").write_bytes(PNG_RED)
+    _library_book(db_path, 20, 2, 1, ["page.png"], seed_cover=False)
+    _create_reading_session(first, 20)
+    store = db_path.parent / f".{db_path.name}.media_pins"
+    (store / "versions" / "20.json").unlink()
+    (store.with_name(store.name + ".bindings") / "20.sha256").unlink()
+    image = "/api/v1/media/asset-20-page-1"
+    assert first.get(image).status_code == 503
+    subprocess.run([sys.executable, "-B", str(ROOT / "database" / "import_seed.py"), "--pin-existing-media"],
+                   check=True)
+    assert first.get(image).content == PNG_RED
+    with closing(sqlite3.connect(db_path)) as db:
+        assert db.execute("SELECT id FROM story_versions").fetchall() == [(20,)]
 
 
 def test_seed_upgrade_fills_missing_snapshots_and_preserves_existing_ones(media_env, monkeypatch):

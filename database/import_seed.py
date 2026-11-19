@@ -1,4 +1,5 @@
-"""Import the repository's draft seed data in a single transaction."""
+"""Import draft seeds or backfill media snapshots for existing versions."""
+import argparse
 import json
 import sqlite3
 import sys
@@ -98,4 +99,14 @@ def import_seed(path: Path, seed_dir: Path = SEED_DIR) -> bool:
 
 
 if __name__ == "__main__":
-    print("Seed data imported." if import_seed(database_path()) else "Seed identities already present.")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pin-existing-media", action="store_true",
+                        help="Pin existing versions using the original media, without importing seeds.")
+    if parser.parse_args().pin_existing_media:
+        path = database_path()
+        with closing(connect(path)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            pin_database_versions(db, db_path=path)
+        print("Existing version media snapshots checked.")
+    else:
+        print("Seed data imported." if import_seed(database_path()) else "Seed identities already present.")

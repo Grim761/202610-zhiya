@@ -145,7 +145,7 @@ def _pin_store_root(db_path: Path | None = None) -> Path:
     return resolved.parent / f".{resolved.name}.media_pins"
 
 
-def _resolve_verified_source(raw_ref: str | None, root: Path) -> tuple[Path, str, str, bytes] | None:
+def _image_path_parts(raw_ref: str | None) -> tuple[str, ...] | None:
     if not raw_ref or not isinstance(raw_ref, str):
         return None
     ref = raw_ref.strip()
@@ -158,6 +158,13 @@ def _resolve_verified_source(raw_ref: str | None, root: Path) -> tuple[Path, str
     if parts[:len(MEDIA_DIR_PREFIX)] == MEDIA_DIR_PREFIX:
         parts = parts[len(MEDIA_DIR_PREFIX):]
     if not parts or posix.suffix.lower() not in ALLOWED_IMAGE_TYPES:
+        return None
+    return parts
+
+
+def _resolve_verified_source(raw_ref: str | None, root: Path) -> tuple[Path, str, str, bytes] | None:
+    parts = _image_path_parts(raw_ref)
+    if parts is None:
         return None
     try:
         candidate = root.joinpath(*parts).resolve()
@@ -293,7 +300,7 @@ def _pin_asset(store_root: Path, root: Path, raw_ref: str | None) -> dict | None
 
 def pin_version_media(db: sqlite3.Connection, version_row: sqlite3.Row | dict, *,
                       source_type: str | None = None, pages: list[sqlite3.Row] | None = None,
-                      db_path: Path | None = None, only_if_missing: bool = False) -> dict:
+                      db_path: Path | None = None, backfill: bool = False) -> dict:
     """Resolve and immutably snapshot verified cover and page assets for one storyVersionId."""
     version_id = int(version_row["id"])
     storybook_id = int(version_row["storybook_id"])
@@ -314,19 +321,20 @@ def pin_version_media(db: sqlite3.Connection, version_row: sqlite3.Row | dict, *
         with _PIN_LOCK:
             manifest = _load_version_manifest(meta_path, binding_path, identity)
             if manifest is not None:
-                if not only_if_missing:
+                if not backfill:
                     ensure_media_dependencies()
                 return manifest
-            if not only_if_missing and cur.execute(
-                "SELECT 1 FROM reading_sessions WHERE version_id = ? LIMIT 1", (version_id,)
-            ).fetchone():
-                raise MediaDependencyError("Reading session requires its original media snapshot")
-            root, entries = ensure_media_dependencies()
             if pages is None:
                 pages = cur.execute("SELECT page_no, image_ref FROM story_pages WHERE version_id = ? ORDER BY page_no",
                                     (version_id,)).fetchall()
+            has_seed_cover = src_type == "LIBRARY" and version_row["source_ref"] == SEED_COVER_SOURCE_REF
+            # Older sessions may predate binding receipts. Text-only versions have no image to rebind.
+            if not backfill and (has_seed_cover or any(_image_path_parts(p["image_ref"]) for p in pages)):
+                if cur.execute("SELECT 1 FROM reading_sessions WHERE version_id = ? LIMIT 1", (version_id,)).fetchone():
+                    raise MediaDependencyError("Reading session requires its original media snapshot")
+            root, entries = ensure_media_dependencies()
             cover_path = None
-            if src_type == "LIBRARY" and version_row["source_ref"] == SEED_COVER_SOURCE_REF:
+            if has_seed_cover:
                 cover_path = _select_cover_path(entries, storybook_id, version_id, version_no)
             manifest = {"identity": identity, "cover": _pin_asset(store_root, root, cover_path), "pages": {}}
             for page in pages:
@@ -352,7 +360,7 @@ def pin_database_versions(db: sqlite3.Connection, *, db_path: Path) -> None:
            JOIN storybooks b ON b.id = v.storybook_id ORDER BY v.id"""
     ).fetchall()
     for row in versions:
-        pin_version_media(db, row, source_type=row["storybook_source_type"], db_path=db_path, only_if_missing=True)
+        pin_version_media(db, row, source_type=row["storybook_source_type"], db_path=db_path, backfill=True)
 
 
 def _file_state(stream) -> tuple[int, ...]:
