@@ -140,7 +140,7 @@ API-026 只批准同一绘本的续写。源快照中相邻的两页必须由源
 
 API-011 普通创建须省略 `sourceReadingSessionId`、`expectedRevision` 和 `clientRequestId`。切换须同时提交这三个非空字段，缺项或显式传 `null` 返回 422 `VALIDATION_ERROR`。遇到已过期的源进度返回 409 `CONTINUATION_STALE`，源会话已经切换则返回 409 `CONTINUATION_ALREADY_SWITCHED`。同键同请求仍重放原结果。切换自动写入的 STARTED 事件不占用客户端的会话事件键。
 
-后继会话保留完整导航路径。阅读小结和成长统计只计入有效路径中从 `startPageNumber` 起的页面。删除源会话后，后继仍返回起读页和继承页数，同时清理与源关联的创建执行记录。
+后继会话保留完整导航路径。阅读小结和成长统计只计入有效路径中从 `startPageNumber` 起的页面。删除源会话后，后继仍返回起读页和继承页数，同时清理与源关联的创建执行记录。删除源快照时，仍依赖它的 `DRAFT` 和 `PENDING_REVIEW` 续写在同一事务内转为 `CHECK_FAILED`。后续审批返回 409 `SESSION_CONFLICT`。此前已批准的版本仍按冻结配图独立阅读。
 
 ## 小结、历史版本与知识修订
 

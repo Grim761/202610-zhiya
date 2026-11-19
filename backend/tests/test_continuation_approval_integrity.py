@@ -311,6 +311,61 @@ def test_approval_commit_failure_keeps_previous_version_and_retry_uses_current_i
         assert image.status_code == 200 and image.content == expected
 
 
+def test_deleting_source_session_blocks_unreviewed_continuation_approval(cont_env, illustrated_draft):
+    client, _, db_path, _ = cont_env
+    media_root, original_png = illustrated_draft
+    with closing(sqlite3.connect(db_path)) as db, db:
+        source_id = db.execute("SELECT source_session_id FROM story_versions WHERE id = 302").fetchone()[0]
+        db.execute("""INSERT INTO story_versions
+            (id, storybook_id, version_no, title, topics_json, age_min, age_max, license_note, status, created_at, branching)
+            SELECT 304, storybook_id, 4, title, topics_json, age_min, age_max, license_note, 'DRAFT', created_at, 0
+            FROM story_versions WHERE id = 301""")
+    _seed_continuation_draft(db_path, 303, 3, source_id, 2, 3, [1, 3], status="DRAFT")
+
+    deleted = client.delete(
+        f"/api/v1/reading-sessions/{source_id}", headers={"X-CSRF-Token": client.cookies["zhiya_csrf"]},
+    )
+    assert deleted.status_code == 204, deleted.text
+    (media_root / "prefix.png").write_bytes(_png("blue"))
+
+    rejected = _approve(client)
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["error"]["code"] == "SESSION_CONFLICT"
+    assert _version_states(db_path) == [
+        (301, "APPROVED_PRIVATE"), (302, "CHECK_FAILED"), (303, "CHECK_FAILED"), (304, "DRAFT"),
+    ]
+    original = client.get("/api/v1/story-versions/301")
+    assert original.status_code == 200, original.text
+    image_ref = original.json()["data"]["pages"][2]["imageRef"]
+    image = client.get(f"/api/v1/media/{image_ref}")
+    assert image.status_code == 200 and image.content == original_png
+
+
+def test_approved_continuation_keeps_frozen_image_after_source_session_deletion(cont_env, illustrated_draft):
+    client, _, db_path, _ = cont_env
+    media_root, original_png = illustrated_draft
+    with closing(sqlite3.connect(db_path)) as db:
+        source_id = db.execute("SELECT source_session_id FROM story_versions WHERE id = 302").fetchone()[0]
+    approved = _approve(client)
+    assert approved.status_code == 200, approved.text
+    approved_page = approved.json()["data"]["pages"][1]
+
+    deleted = client.delete(
+        f"/api/v1/reading-sessions/{source_id}", headers={"X-CSRF-Token": client.cookies["zhiya_csrf"]},
+    )
+    assert deleted.status_code == 204, deleted.text
+    (media_root / "prefix.png").write_bytes(_png("blue"))
+
+    fetched = client.get("/api/v1/story-versions/302")
+    assert fetched.status_code == 200, fetched.text
+    fetched_page = fetched.json()["data"]["pages"][1]
+    assert fetched_page["text"] == approved_page["text"] == "v1第3页"
+    assert fetched_page["imageRef"] == approved_page["imageRef"]
+    image = client.get(f"/api/v1/media/{fetched_page['imageRef']}")
+    assert image.status_code == 200 and image.content == original_png
+    assert _version_states(db_path) == [(301, "RETIRED"), (302, "APPROVED_PRIVATE")]
+
+
 def test_approval_freezes_image_for_original_without_continuation(cont_env, tmp_path, monkeypatch):
     client, _, db_path, _ = cont_env
     monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(tmp_path))
