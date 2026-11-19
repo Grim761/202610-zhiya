@@ -154,11 +154,24 @@ def test_original_generation_checks_and_persists_only_valid_drafts(cont_env, mon
                            json={**payload, "clientRequestId": "valid-story"})
     assert accepted.status_code == 201, accepted.text
     data = accepted.json()["data"]
+    vid = data["storyVersionId"]
     assert [page["text"] for page in data["pages"]] == texts
+    assert [page["imageRef"] for page in data["pages"]] == [f"asset-{vid}-page-{p}" for p in range(1, 6)]
     assert [(branch["fromPageNumber"], branch["nextPageNumber"]) for branch in data["branches"]] == [(2, 3), (2, 4)]
-    approved = client.post(f"/api/v1/story-versions/{data['storyVersionId']}/approvals", headers=headers,
+    assert client.get(f"/api/v1/media/asset-{vid}-page-1").status_code == 404
+    with closing(sqlite3.connect(db_path)) as db:
+        stored_pages = db.execute(
+            "SELECT page_no, image_ref, image_license_note FROM story_pages WHERE version_id = ? ORDER BY page_no",
+            (vid,),
+        ).fetchall()
+        assert len(stored_pages) == 5
+        assert all(ref != "none" and note == "NO-COMMERCIAL" for _, ref, note in stored_pages)
+    approved = client.post(f"/api/v1/story-versions/{vid}/approvals", headers=headers,
                            json={"versionNumber": 1, "reviewedAllBranches": True})
     assert approved.status_code == 200, approved.text
+    for page in approved.json()["data"]["pages"]:
+        img = client.get(f"/api/v1/media/{page['imageRef']}")
+        assert img.status_code == 200 and img.headers["content-type"] == "image/png" and len(img.content) > 0
 
 
 def test_story_generation_validation_limits_and_mode_guards(cont_env, monkeypatch):
@@ -411,6 +424,196 @@ def test_story_generation_execution_lifecycle_fenced_json_and_race_guards(cont_e
     assert client.delete(f"/api/v1/reading-sessions/{sid}", headers=headers).status_code == 204
     with closing(sqlite3.connect(db_path)) as db:
         assert db.execute("SELECT COUNT(*) FROM request_executions WHERE scope_type = 'STORY_GENERATION'").fetchone()[0] == 0
+
+
+def test_story_generation_gateway_60s_budget_and_template_illustrations_4_pages(cont_env, monkeypatch):
+    import asyncio
+    import httpx
+    from app.adapters.model import ModelAdapter
+    from app.config import Settings
+    from app.errors import ServiceError
+    from app.model_gateway import ModelGateway
+    from app.schemas.agent import ModelGenerateRequest
+
+    client, _, db_path, _ = cont_env
+    headers = {"X-CSRF-Token": client.cookies["zhiya_csrf"]}
+    provider_calls = 0
+
+    async def slow_handler(request):
+        nonlocal provider_calls
+        provider_calls += 1
+        await asyncio.sleep(0.08)
+        return httpx.Response(200, json={
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps({
+                        "title": "小熊去散步",
+                        "pages": ["第1页故事。", "第2页故事。", "第3页故事。", "第4页故事。"],
+                    }, ensure_ascii=False),
+                },
+            }],
+        })
+
+    settings = Settings(
+        model_api_url="https://model.example.test/v1/chat/completions",
+        model_api_key="fake-key",
+        model_name="test-model",
+        model_timeout_seconds=0.04,
+    )
+    gateway = ModelGateway(settings, transport=httpx.MockTransport(slow_handler))
+    adapter = ModelAdapter(gateway)
+    monkeypatch.setattr(client.app.state, "model_adapter", adapter)
+    try:
+        # Normal text request keeps the shorter gateway timeout (0.04s < 0.08s -> TIMEOUT).
+        normal_res = client.portal.call(
+            adapter.generate,
+            ModelGenerateRequest(system_prompt="规则", context_text="上下文", user_input="正常问题"),
+        )
+        assert normal_res.success is False and normal_res.error_code == "TIMEOUT"
+        assert provider_calls == 1
+
+        # Invalid explicit timeout_seconds is rejected without calling provider.
+        try:
+            client.portal.call(
+                lambda: gateway.generate(input_text="hi", system_prompt="sys", timeout_seconds=61.0),
+            )
+            raise AssertionError("Expected ServiceError for timeout > 60")
+        except ServiceError as exc:
+            assert exc.code == "INVALID_INPUT"
+
+        # API-025 uses the 60s budget so the 0.08s delayed response succeeds and assigns licensed templates.
+        resp = client.post("/api/v1/story-generations", headers=headers, json={
+            "ageBand": "AGE_3_4", "topic": "勇气", "characters": ["小熊"], "scene": "树林",
+            "branching": False, "clientRequestId": "budget-60s-4pages",
+        })
+        assert resp.status_code == 201, resp.text
+        assert provider_calls == 2
+        data = resp.json()["data"]
+        vid = data["storyVersionId"]
+        assert data["checkResults"]["licensePassed"] is True
+        assert [p["imageRef"] for p in data["pages"]] == [f"asset-{vid}-page-{n}" for n in range(1, 5)]
+
+        with closing(sqlite3.connect(db_path)) as db:
+            rows = db.execute(
+                "SELECT image_ref, image_license_note FROM story_pages WHERE version_id = ? ORDER BY page_no",
+                (vid,),
+            ).fetchall()
+            assert len(rows) == 4
+            assert all(ref != "none" and note == "NO-COMMERCIAL" for ref, note in rows)
+
+        approved = client.post(f"/api/v1/story-versions/{vid}/approvals", headers=headers,
+                               json={"versionNumber": 1, "reviewedAllBranches": True})
+        assert approved.status_code == 200, approved.text
+        detail = client.get(f"/api/v1/story-versions/{vid}")
+        assert detail.status_code == 200
+        for p in detail.json()["data"]["pages"]:
+            img = client.get(f"/api/v1/media/{p['imageRef']}")
+            assert img.status_code == 200 and img.headers["content-type"] == "image/png"
+    finally:
+        client.portal.call(gateway.__aexit__)
+
+
+def test_continuation_preflight_carried_blob_missing_and_save_retry_once(cont_env, monkeypatch, tmp_path):
+    from PIL import Image
+    import app.api.v1.story_generations as sg
+    from app.services.story_media import MediaDependencyError
+
+    client, _, db_path, profile = cont_env
+    headers = {"X-CSRF-Token": client.cookies["zhiya_csrf"]}
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(media_root))
+    (media_root / "p1.png").write_bytes(b"")
+    Image.new("RGB", (4, 4), "green").save(media_root / "p1.png")
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE story_pages SET image_ref = 'p1.png' WHERE version_id = 301 AND page_no = 1")
+
+    # Pin version 301 so its manifest and blob exist on disk.
+    assert client.get("/api/v1/media/asset-301-page-1").status_code == 200
+    sid = client.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile, "storyVersionId": 301, "mode": "PARENT_CHILD",
+    }).json()["data"]["readingSessionId"]
+    for page, ev in ((1, "STARTED"), (2, "PAGE_CHANGED")):
+        assert client.post(f"/api/v1/reading-sessions/{sid}/events", headers=headers, json={
+            "eventType": ev, "pageNumber": page, "expectedRevision": page - 1, "clientEventId": f"c-{page}",
+        }).status_code == 201
+
+    model_calls = 0
+
+    class StoryModel:
+        async def generate(self, request):
+            nonlocal model_calls
+            model_calls += 1
+            return ModelGenerateResult(success=True, text=json.dumps({
+                "title": "重试续写", "pages": ["新第3页。", "新第4页。"],
+            }))
+
+    monkeypatch.setattr(client.app.state, "model_adapter", StoryModel())
+    req = {
+        "sourceReadingSessionId": sid, "expectedRevision": 2, "topic": "互助",
+        "characters": ["小狐狸"], "scene": "森林", "branching": False, "clientRequestId": "blob-check-1",
+    }
+
+    # Remove ONLY the specific carried page blob while manifest remains intact.
+    blobs_dir = db_path.parent / f".{db_path.name}.media_pins" / "blobs"
+    blob_file = next(blobs_dir.iterdir())
+    backup_blob = tmp_path / blob_file.name
+    blob_file.rename(backup_blob)
+
+    pre_fail = client.post("/api/v1/story-generations", headers=headers, json=req)
+    assert pre_fail.status_code == 503 and pre_fail.json()["error"]["retryable"] is True
+    assert model_calls == 0
+
+    # Restore the blob and retry with the same clientRequestId -> succeeds with 1 model call.
+    backup_blob.rename(blob_file)
+    pre_ok = client.post("/api/v1/story-generations", headers=headers, json=req)
+    assert pre_ok.status_code == 201, pre_ok.text
+    assert model_calls == 1
+
+    # Transient MediaDependencyError during save_draft retries once in memory without a second model call.
+    real_ensure = sg.ensure_version_pages_media
+    transient_attempts = 0
+
+    def flaky_save_ensure(db, version_row, page_numbers):
+        nonlocal transient_attempts
+        # Reserve calls ensure_version_pages_media once; save_draft calls it a second time.
+        transient_attempts += 1
+        if transient_attempts == 2:
+            raise MediaDependencyError("transient storage glitch")
+        return real_ensure(db, version_row, page_numbers)
+
+    monkeypatch.setattr(sg, "ensure_version_pages_media", flaky_save_ensure)
+    transient_res = client.post("/api/v1/story-generations", headers=headers,
+                                json={**req, "clientRequestId": "save-transient-1"})
+    assert transient_res.status_code == 201, transient_res.text
+    assert model_calls == 2
+    assert transient_attempts == 3
+    with closing(sqlite3.connect(db_path)) as db:
+        assert db.execute("SELECT COUNT(*) FROM story_versions").fetchone()[0] == 3
+
+    # Persistent MediaDependencyError during save_draft fails after 1 retry and replays 503.
+    save_calls = 0
+
+    def persistent_save_ensure(db, version_row, page_numbers):
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls >= 2:
+            raise MediaDependencyError("persistent storage outage")
+        return real_ensure(db, version_row, page_numbers)
+
+    monkeypatch.setattr(sg, "ensure_version_pages_media", persistent_save_ensure)
+    persistent_res = client.post("/api/v1/story-generations", headers=headers,
+                                 json={**req, "clientRequestId": "save-persist-1"})
+    assert persistent_res.status_code == 503 and persistent_res.json()["error"]["retryable"] is False
+    assert model_calls == 3
+    assert save_calls == 3
+    assert client.post("/api/v1/story-generations", headers=headers,
+                       json={**req, "clientRequestId": "save-persist-1"}).status_code == 503
+    assert model_calls == 3
+    with closing(sqlite3.connect(db_path)) as db:
+        assert db.execute("SELECT COUNT(*) FROM story_versions").fetchone()[0] == 3
 
 
 

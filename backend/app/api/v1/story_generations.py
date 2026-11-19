@@ -18,7 +18,15 @@ from app.api.v1.reading_sessions import MAX_ID, fail_execution, replay_execution
 from app.api.v1.storybooks import AGES, AgeBand, _verify_version_for_approval
 from app.schemas.agent import ModelGenerateRequest
 from app.services.reading_agent import SENSITIVE
-from app.services.story_media import MediaDependencyError, page_image_ref_from_manifest, pin_version_media
+from app.services.story_media import (
+    TEMPLATE_VERSION_LICENSE_NOTE,
+    MediaDependencyError,
+    ensure_version_pages_media,
+    page_image_ref_from_manifest,
+    resolve_optional_template_illustrations,
+    select_template_illustrations,
+    verify_template_illustrations,
+)
 
 
 router = APIRouter(prefix="/api/v1")
@@ -140,7 +148,9 @@ def reserve_generation(request, payload, digest):
             )
         if source is not None:
             source_version = db.execute("SELECT * FROM story_versions WHERE id = ?", (source["version_id"],)).fetchone()
-            pin_version_media(db, source_version, source_type="ORIGINAL")
+            ensure_version_pages_media(db, source_version, prefix)
+        else:
+            verify_template_illustrations(select_template_illustrations(payload.ageBand, payload.topic, total))
         token = str(uuid4())
         now = int(time.time() * 1000)
         db.execute(
@@ -176,7 +186,10 @@ async def generate_text(request, payload, source, carried_pages, total, decision
         raise RuntimeError("model adapter unavailable")
     async with asyncio.timeout(60):
         result = await adapter.generate(ModelGenerateRequest(
-            system_prompt=prompt, context_text=json.dumps(context, ensure_ascii=False), user_input="生成绘本文字草稿",
+            system_prompt=prompt,
+            context_text=json.dumps(context, ensure_ascii=False),
+            user_input="生成绘本文字草稿",
+            timeout_seconds=60.0,
         ))
     if not result.success:
         if result.error_code == "TIMEOUT":
@@ -201,7 +214,8 @@ def save_draft(db, request, payload, owner, source, carried_pages, total, decisi
         snapshot = (None,) * 6
         continuation = {}
         source_manifest = None
-        license_note = "模型生成原创文字，待家长审核"
+        license_note = TEMPLATE_VERSION_LICENSE_NOTE
+        new_assets = verify_template_illustrations(select_template_illustrations(age_band, payload.topic, total))
     else:
         book_id = source["storybook_id"]
         number = db.execute(
@@ -218,8 +232,9 @@ def save_draft(db, request, payload, owner, source, carried_pages, total, decisi
             "sourceVisitedPageNumbers": prefix, "resumePageNumber": resume,
         }}
         source_version = db.execute("SELECT * FROM story_versions WHERE id = ?", (source["version_id"],)).fetchone()
-        source_manifest = pin_version_media(db, source_version, source_type="ORIGINAL")
+        source_manifest = ensure_version_pages_media(db, source_version, prefix)
         license_note = source["license_note"]
+        new_assets = resolve_optional_template_illustrations(age_band, payload.topic, total, len(carried_pages))
     version_id = db.execute(
         """INSERT INTO story_versions
            (storybook_id, version_no, title, topics_json, age_min, age_max, license_note, status, created_at,
@@ -234,14 +249,17 @@ def save_draft(db, request, payload, owner, source, carried_pages, total, decisi
     for page_no, page_text in enumerate(texts, start=1):
         carried = carried_pages[page_no - 1] if page_no <= len(carried_pages) else None
         next_page = page_no + 1 if page_no < total and page_no != decision else None
+        if carried is not None:
+            image_ref = carried["image_ref"]
+            image_license_note = carried["image_license_note"]
+            image = page_image_ref_from_manifest(source["version_id"], carried["page_no"], source_manifest)
+        else:
+            image_ref, image_license_note = new_assets[page_no - len(carried_pages) - 1]
+            image = None if image_ref == "none" else f"asset-{version_id}-page-{page_no}"
         db.execute(
             """INSERT INTO story_pages (version_id, page_no, body_text, image_ref, image_license_note,
                                       default_next_page_number) VALUES (?, ?, ?, ?, ?, ?)""",
-            (version_id, page_no, page_text, carried["image_ref"] if carried is not None else "none",
-             carried["image_license_note"] if carried is not None else None, next_page),
-        )
-        image = None if carried is None else page_image_ref_from_manifest(
-            source["version_id"], carried["page_no"], source_manifest,
+            (version_id, page_no, page_text, image_ref, image_license_note, next_page),
         )
         pages.append({"pageNumber": page_no, "text": page_text, "imageRef": image,
                       "defaultNextPageNumber": next_page})
@@ -265,7 +283,8 @@ def save_draft(db, request, payload, owner, source, carried_pages, total, decisi
     }, "requestId": request.state.request_id})
 
 
-def finish_generation(request, payload, digest, reserved, result, execution_status):
+def finish_generation(request, payload, digest, reserved, result, execution_status, *,
+                      record_media_failure: bool = False):
     owner, token, source, carried_pages, total, decision = reserved
     with authorized_db(request, write=True, guardian_only=True) as (db, principal, failure):
         if failure:
@@ -316,6 +335,8 @@ def finish_generation(request, payload, digest, reserved, result, execution_stat
             try:
                 result = save_draft(db, request, payload, owner, source, carried_pages, total, decision, result, now)
             except MediaDependencyError:
+                if not record_media_failure:
+                    raise
                 result = error(request, 503, "DEPENDENCY_UNAVAILABLE", "绘本媒体暂不可用")
             if result.status_code != 201:
                 db.execute("ROLLBACK TO draft")
@@ -355,9 +376,12 @@ async def generate_story(payload: StoryGeneration, request: Request):
                        request.state.request_id, type(exc).__name__)
         status = "FAILED"
         result = error(request, 503, "DEPENDENCY_UNAVAILABLE", "生成服务暂不可用")
-    for _ in range(2):
+    for attempt in range(2):
         try:
-            return finish_generation(request, payload, digest, reserved, result, status)
-        except sqlite3.Error:
+            return finish_generation(
+                request, payload, digest, reserved, result, status,
+                record_media_failure=(attempt == 1),
+            )
+        except (sqlite3.Error, MediaDependencyError):
             continue
     return error(request, 503, "DEPENDENCY_UNAVAILABLE", "暂时无法保存生成结果", retryable=True)
