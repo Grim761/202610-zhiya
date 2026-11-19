@@ -126,7 +126,7 @@ def test_generation_approval_and_continuation_switch(cont_env, monkeypatch, tmp_
 
 
 def test_original_generation_checks_and_persists_only_valid_drafts(cont_env, monkeypatch):
-    client, _, db_path, _ = cont_env
+    client, other, db_path, _ = cont_env
     headers = {"X-CSRF-Token": client.cookies["zhiya_csrf"]}
     payload = {"ageBand": "AGE_4_5", "topic": "互助", "characters": ["小兔子"], "scene": "森林",
                "branching": True, "clientRequestId": "invalid-story"}
@@ -170,8 +170,10 @@ def test_original_generation_checks_and_persists_only_valid_drafts(cont_env, mon
                            json={"versionNumber": 1, "reviewedAllBranches": True})
     assert approved.status_code == 200, approved.text
     for page in approved.json()["data"]["pages"]:
-        img = client.get(f"/api/v1/media/{page['imageRef']}")
+        url = f"/api/v1/media/{page['imageRef']}"
+        img = client.get(url)
         assert img.status_code == 200 and img.headers["content-type"] == "image/png" and len(img.content) > 0
+        assert other.get(url).status_code == 404
 
 
 def test_story_generation_validation_limits_and_mode_guards(cont_env, monkeypatch):
@@ -438,10 +440,12 @@ def test_story_generation_gateway_60s_budget_and_template_illustrations_4_pages(
     client, _, db_path, _ = cont_env
     headers = {"X-CSRF-Token": client.cookies["zhiya_csrf"]}
     provider_calls = 0
+    transport_budgets = []
 
     async def slow_handler(request):
         nonlocal provider_calls
         provider_calls += 1
+        transport_budgets.append(set(request.extensions["timeout"].values()))
         await asyncio.sleep(0.08)
         return httpx.Response(200, json={
             "choices": [{
@@ -490,6 +494,7 @@ def test_story_generation_gateway_60s_budget_and_template_illustrations_4_pages(
         })
         assert resp.status_code == 201, resp.text
         assert provider_calls == 2
+        assert transport_budgets == [{0.04}, {60.0}]
         data = resp.json()["data"]
         vid = data["storyVersionId"]
         assert data["checkResults"]["licensePassed"] is True
@@ -513,6 +518,31 @@ def test_story_generation_gateway_60s_budget_and_template_illustrations_4_pages(
             assert img.status_code == 200 and img.headers["content-type"] == "image/png"
     finally:
         client.portal.call(gateway.__aexit__)
+
+
+def test_original_generation_requires_recognized_template_license_before_model_call(cont_env, monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock
+    from app.services import story_media
+
+    client, _, db_path, _ = cont_env
+    source_pages = json.loads(story_media.DEFAULT_TEMPLATE_PAGES.read_text(encoding="utf-8"))
+    for page in source_pages:
+        if page.get("image_license_note") == "NO-COMMERCIAL":
+            page["image_license_note"] = "禁止使用"
+    catalog = tmp_path / "template-pages.json"
+    catalog.write_text(json.dumps(source_pages), encoding="utf-8")
+    monkeypatch.setattr(story_media, "DEFAULT_TEMPLATE_PAGES", catalog)
+    model = AsyncMock()
+    monkeypatch.setattr(client.app.state, "model_adapter", model)
+
+    response = client.post("/api/v1/story-generations", headers={"X-CSRF-Token": client.cookies["zhiya_csrf"]},
+                           json={"ageBand": "AGE_3_4", "topic": "互助", "characters": ["小兔"], "scene": "森林",
+                                 "branching": False, "clientRequestId": "restricted-template"})
+    assert response.status_code == 503 and response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+    model.generate.assert_not_awaited()
+    with closing(sqlite3.connect(db_path)) as db:
+        assert not db.execute("SELECT 1 FROM request_executions WHERE client_request_id = 'restricted-template'").fetchone()
+        assert db.execute("SELECT COUNT(*) FROM story_versions").fetchone()[0] == 1
 
 
 def test_continuation_preflight_carried_blob_missing_and_save_retry_once(cont_env, monkeypatch, tmp_path):
@@ -567,7 +597,11 @@ def test_continuation_preflight_carried_blob_missing_and_save_retry_once(cont_en
     assert model_calls == 0
 
     # Restore the blob and retry with the same clientRequestId -> succeeds with 1 model call.
-    backup_blob.rename(blob_file)
+    blob_file.write_bytes(b"unreadable image bytes")
+    corrupt = client.post("/api/v1/story-generations", headers=headers, json=req)
+    assert corrupt.status_code == 503 and corrupt.json()["error"]["retryable"] is True
+    assert model_calls == 0
+    backup_blob.replace(blob_file)
     pre_ok = client.post("/api/v1/story-generations", headers=headers, json=req)
     assert pre_ok.status_code == 201, pre_ok.text
     assert model_calls == 1

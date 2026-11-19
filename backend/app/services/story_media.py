@@ -20,6 +20,7 @@ DEFAULT_TEMPLATE_VERSIONS = REPO_ROOT / "data" / "seed" / "story_versions.json"
 DEFAULT_TEMPLATE_PAGES = REPO_ROOT / "data" / "seed" / "story_pages.json"
 SEED_COVER_SOURCE_REF = "妈妈夸我说的队 · 知芽项目自研绘本"
 TEMPLATE_VERSION_LICENSE_NOTE = "模型生成原创文字，配合知芽项目自研非商用模板插画（NO-COMMERCIAL），待家长审核"
+TEMPLATE_PAGE_LICENSE = "NO-COMMERCIAL"
 AGE_BAND_BOUNDS = {"AGE_3_4": (3, 4), "AGE_4_5": (4, 5), "AGE_5_6": (5, 6)}
 ALLOWED_IMAGE_TYPES = {
     ".png": "image/png",
@@ -510,7 +511,7 @@ def _template_catalog() -> list[dict]:
         for item in ordered:
             ref = item.get("image_ref")
             note = (item.get("image_license_note") or "").strip()
-            if _image_path_parts(ref) is not None and note:
+            if _image_path_parts(ref) is not None and note == TEMPLATE_PAGE_LICENSE:
                 assets.append((str(ref), note))
         if len(assets) >= 4:
             catalog.append({
@@ -546,7 +547,7 @@ def verify_template_illustrations(assets: list[tuple[str, str]]) -> list[tuple[s
     """Ensure every selected template illustration has an explicit license and decodes cleanly."""
     root, _ = ensure_media_dependencies()
     for ref, license_note in assets:
-        if not (license_note or "").strip() or _resolve_verified_source(ref, root) is None:
+        if license_note != TEMPLATE_PAGE_LICENSE or _resolve_verified_source(ref, root) is None:
             raise MediaDependencyError("Template illustration is unavailable")
     return assets
 
@@ -562,7 +563,7 @@ def resolve_optional_template_illustrations(
     if not os.environ.get("ZHIYA_MEDIA_ROOT", "").strip():
         return list(verify_template_illustrations(selected))
     root, _ = ensure_media_dependencies()
-    if all((note or "").strip() and _resolve_verified_source(ref, root) is not None for ref, note in selected):
+    if all(note == TEMPLATE_PAGE_LICENSE and _resolve_verified_source(ref, root) is not None for ref, note in selected):
         return list(selected)
     return [("none", None)] * needed
 
