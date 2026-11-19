@@ -2,8 +2,10 @@
 
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from fastapi.testclient import TestClient
@@ -167,7 +169,18 @@ def test_continuation_switch_tc_fr17_04_and_idempotency(cont_env):
         "clientRequestId": "switch-001",
     }
     assert second.post("/api/v1/reading-sessions", headers=h2, json=switch_body).status_code == 404
-    switched = first.post("/api/v1/reading-sessions", headers=h1, json=switch_body)
+
+    simultaneous = Barrier(2, timeout=5)
+
+    def switch():
+        simultaneous.wait()
+        return first.post("/api/v1/reading-sessions", headers=h1, json=switch_body)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        requests = [pool.submit(switch) for _ in range(2)]
+        replayed, switched = sorted(
+            (pending.result() for pending in requests), key=lambda response: response.status_code,
+        )
     assert switched.status_code == 201 and switched.json()["requestId"] == switched.headers["X-Request-ID"]
     sdata = switched.json()["data"]
     sid2 = sdata["readingSessionId"]
@@ -193,10 +206,21 @@ def test_continuation_switch_tc_fr17_04_and_idempotency(cont_env):
     with closing(sqlite3.connect(db_path)) as db:
         assert db.execute("SELECT end_reason FROM reading_sessions WHERE id = ?", (sid1,)).fetchone()[0] == "CONTINUED"
 
-    # Same-key replay returns 200 with original session without creating a second successor.
-    replayed = first.post("/api/v1/reading-sessions", headers=h1, json=switch_body)
+    # Concurrent same-key replay returns 200 for the original successor.
     assert replayed.status_code == 200 and replayed.json()["data"] == sdata
     assert replayed.json()["requestId"] == replayed.headers["X-Request-ID"] != switched.json()["requestId"]
+    with closing(sqlite3.connect(db_path)) as db:
+        successors = db.execute(
+            "SELECT id FROM reading_sessions WHERE source_reading_session_id = ?", (sid1,),
+        ).fetchall()
+        reports = db.execute("SELECT session_id FROM reading_reports WHERE session_id = ?", (sid1,)).fetchall()
+        starts = db.execute(
+            "SELECT id FROM interaction_events WHERE session_id = ? AND event_type = 'STARTED'", (sid2,),
+        ).fetchall()
+        assert successors == [(sid2,)]
+        assert reports == [(sid1,)]
+        assert len(starts) == 1
+        assert db.execute("SELECT COUNT(*) FROM request_executions WHERE scope_type = 'SESSION_CREATE'").fetchone() == (1,)
 
     # Same key with changed body -> 409 IDEMPOTENCY_CONFLICT; new key -> 409 SESSION_CONFLICT.
     assert first.post("/api/v1/reading-sessions", headers=h1,
@@ -210,9 +234,14 @@ def test_continuation_switch_tc_fr17_04_and_idempotency(cont_env):
     assert chosen.status_code == 201 and chosen.json()["data"]["currentPage"] == 4
     assert chosen.json()["data"]["visitedPageNumbers"] == [1, 2, 3, 4]
 
-    # Deleting source session preserves successor with source_reading_session_id cleared.
+    # Deleting source session clears its ID and preserves successor recovery metadata.
     assert first.delete(f"/api/v1/reading-sessions/{sid1}", headers=h1).status_code == 204
-    assert first.get(f"/api/v1/reading-sessions/{sid2}").json()["data"]["session"]["storyVersionId"] == 302
+    restored = first.get(f"/api/v1/reading-sessions/{sid2}").json()["data"]["session"]
+    assert "sourceReadingSessionId" not in restored
+    assert restored["storyVersionId"] == 302
+    assert restored["currentPage"] == 4
+    assert restored["startPageNumber"] == 3
+    assert restored["carriedPrefixPageCount"] == 2
 
 
 def test_continuation_switch_stale_snapshot_and_atomic_rollback_tc_fr17_05(cont_env):
@@ -401,4 +430,3 @@ def test_approval_enforces_backend_safety_freezes_media_and_handles_dependency_r
     assert first.delete(f"/api/v1/reading-sessions/{sid2}", headers=h1).status_code == 204
     with closing(sqlite3.connect(db_path)) as db:
         assert db.execute("SELECT COUNT(*) FROM request_executions WHERE scope_type = 'SESSION_CREATE'").fetchone()[0] == 0
-

@@ -145,8 +145,10 @@ def session_object(row):
         "mode": row["mode"], "status": row["status"], "revision": row["revision"],
         "expiresAt": iso_utc(expiry) if expiry is not None else None,
     }
-    if row["source_reading_session_id"] is not None:
-        data["sourceReadingSessionId"] = row["source_reading_session_id"]
+    source_session_id = row["source_reading_session_id"]
+    if source_session_id is not None:
+        data["sourceReadingSessionId"] = source_session_id
+    if source_session_id is not None or row["carried_prefix_page_count"] > 0:
         data["startPageNumber"] = row["start_page_number"]
         data["carriedPrefixPageCount"] = row["carried_prefix_page_count"]
     return data
