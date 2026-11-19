@@ -2510,9 +2510,10 @@
     "continuationSwitch": [
       "本期FR-17 P1验收流程，覆盖TC-FR17-04/05；范围及审批状态见common.deliveryScope。",
       "API-025固定源会话revision=12及路径[1,2]，生成版本302和继续点3",
-      "API-026批准version=2，源会话仍IN_PROGRESS/revision=12",
+      "API-026核对同一绘本、继承页正文与冻结配图，批准version=2，源会话仍IN_PROGRESS/revision=12",
       "API-011提交sourceReadingSessionId和switch-001，在同一事务关闭旧会话并启动会话402第3页",
-      "源快照过期409且旧会话不变；数据库提交失败503且全部回滚；提交后丢响应以同键重放既有会话402，不创建第二个后继"
+      "新请求遇到过期源快照返回409 CONTINUATION_STALE，源会话已切换返回409 CONTINUATION_ALREADY_SWITCHED。提交失败503并回滚，丢响应时按原键重放既有会话402",
+      "后继的完整路径用于导航，小结与成长页数从startPageNumber起计算。删除源记录后保留startPageNumber和carriedPrefixPageCount"
     ]
   },
   "version": "v0.4",

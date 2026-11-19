@@ -15,6 +15,7 @@ from app.services.story_media import (
     MediaDependencyError,
     cover_ref_from_manifest,
     ensure_media_dependencies,
+    freeze_approval_page_media,
     page_image_ref_for,
     page_image_ref_from_manifest,
     pin_version_media,
@@ -270,8 +271,10 @@ def _verify_version_for_approval(db, version_row, owner: int) -> str | None:
         if branches:
             return "非分支版本不得包含故事分支"
     else:
-        if not 1 <= len(by_from) <= 2 or any(len(opts) < 2 for opts in by_from.values()):
-            return "分支版本须包含 1 至 2 个决策节点且每节点至少两个选项"
+        if not 1 <= len(by_from) <= 2 or any(
+            len({b["next_page_no"] for b in options}) < 2 for options in by_from.values()
+        ):
+            return "分支版本须包含 1 至 2 个决策节点，每个节点至少有两个不同的后续页"
 
     reachable: set[int] = set()
     stack: list[tuple[int, set[int], int]] = [(1, {1}, 1)]
@@ -307,17 +310,29 @@ def _verify_version_for_approval(db, version_row, owner: int) -> str | None:
                 or prefix[0] != 1 or prefix[-1] != version_row["source_page_no"]
                 or version_row["resume_page_no"] != len(prefix) + 1):
             return "续写前缀或继续页码不合法"
-        source_text = dict(db.execute(
-            "SELECT page_no, body_text FROM story_pages WHERE version_id = ?",
+        src = db.execute(
+            """SELECT s.id FROM reading_sessions s
+               JOIN child_profiles p ON p.id = s.profile_id
+               JOIN story_versions sv ON sv.id = s.version_id
+               WHERE s.id = ? AND p.guardian_id = ? AND s.version_id = ? AND sv.storybook_id = ?
+                 AND s.mode = 'PARENT_CHILD' AND sv.status <> 'WITHDRAWN'""",
+            (version_row["source_session_id"], owner, version_row["source_version_id"], version_row["storybook_id"]),
+        ).fetchone()
+        if not src:
+            return "续写源会话与绘本不匹配或不可用"
+        source_pages = {p["page_no"]: p for p in db.execute(
+            "SELECT page_no, body_text, image_ref FROM story_pages WHERE version_id = ?",
             (version_row["source_version_id"],),
-        ).fetchall())
+        )}
         for carried_page, source_page in enumerate(prefix, start=1):
-            if source_page not in source_text:
+            if source_page not in source_pages:
                 return "续写源版本页面不存在"
             if carried_page not in page_map:
                 return "续写前文页码不完整"
-            if page_map[carried_page]["body_text"] != source_text[source_page]:
+            if page_map[carried_page]["body_text"] != source_pages[source_page]["body_text"]:
                 return "续写前文正文与源版本不一致"
+            if page_map[carried_page]["image_ref"] != source_pages[source_page]["image_ref"]:
+                return "续写前文配图与源版本不一致"
         for pno in range(1, len(prefix)):
             if page_map[pno]["default_next_page_number"] != pno + 1:
                 return "续写前文阅读路径不连续"
@@ -328,16 +343,6 @@ def _verify_version_for_approval(db, version_row, owner: int) -> str | None:
             k_targets.add(page_map[k]["default_next_page_number"])
         if resume_no not in page_map or resume_no not in k_targets:
             return "续写继续页码不可达"
-        src = db.execute(
-            """SELECT s.id FROM reading_sessions s
-               JOIN child_profiles p ON p.id = s.profile_id
-               JOIN story_versions sv ON sv.id = s.version_id
-               WHERE s.id = ? AND p.guardian_id = ? AND s.version_id = ?
-                 AND s.mode = 'PARENT_CHILD' AND sv.status <> 'WITHDRAWN'""",
-            (version_row["source_session_id"], owner, version_row["source_version_id"]),
-        ).fetchone()
-        if not src:
-            return "续写源会话不存在或无权访问"
     return None
 
 
@@ -365,6 +370,7 @@ def approve_story_version(payload: VersionApproval, request: Request,
             reason = _verify_version_for_approval(db, row, owner)
             if reason is not None:
                 return error(request, 422, "VALIDATION_ERROR", reason)
+            page_media = freeze_approval_page_media(db, row)
             now = int(time.time() * 1000)
             db.execute(
                 """UPDATE story_versions SET status = 'RETIRED'
@@ -376,9 +382,10 @@ def approve_story_version(payload: VersionApproval, request: Request,
                 (version_id,),
             )
             db.execute(
-                """UPDATE story_versions SET status = 'APPROVED_PRIVATE', reviewed_by_id = ?, reviewed_at = ?
+                """UPDATE story_versions SET status = 'APPROVED_PRIVATE', reviewed_by_id = ?, reviewed_at = ?,
+                   approved_page_media_json = ?
                    WHERE id = ? AND status = 'PENDING_REVIEW'""",
-                (owner, now, version_id),
+                (owner, now, page_media, version_id),
             )
             updated = db.execute(
                 """SELECT v.*, b.source_type AS storybook_source_type FROM story_versions v

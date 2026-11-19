@@ -47,15 +47,15 @@ def cont_env(tmp_path, monkeypatch):
 
 def _seed_continuation_draft(db_path: Path, version_id: int, version_no: int, src_session_id: int,
                              src_revision: int, src_page: int, prefix: list[int], *,
-                             status: str = "PENDING_REVIEW", branching: int = 0):
+                             status: str = "PENDING_REVIEW", branching: int = 0, src_version_id: int = 301):
     with closing(sqlite3.connect(db_path)) as db, db:
         db.execute("PRAGMA foreign_keys = ON")
         db.execute("""INSERT INTO story_versions
             (id, storybook_id, version_no, title, topics_json, age_min, age_max,
              license_note, status, created_at, source_version_id, source_session_id,
              source_revision, source_page_no, resume_page_no, source_visited_pages_json, branching)
-            VALUES (?, 201, ?, '小狐狸续写', '["互助"]', 3, 5, '原创授权', ?, 1, 301, ?, ?, ?, ?, ?, ?)""",
-            (version_id, version_no, status, src_session_id, src_revision, src_page,
+            VALUES (?, 201, ?, '小狐狸续写', '["互助"]', 3, 5, '原创授权', ?, 1, ?, ?, ?, ?, ?, ?, ?)""",
+            (version_id, version_no, status, src_version_id, src_session_id, src_revision, src_page,
              len(prefix) + 1, json.dumps(prefix), branching))
         if branching == 0:
             for pno, nxt in ((1, 2), (2, 3), (3, 4), (4, 5), (5, None)):
@@ -72,9 +72,9 @@ def _seed_continuation_draft(db_path: Path, version_id: int, version_no: int, sr
         for carried_page, source_page in enumerate(prefix, start=1):
             db.execute(
                 """UPDATE story_pages SET body_text = (
-                       SELECT body_text FROM story_pages WHERE version_id = 301 AND page_no = ?
+                       SELECT body_text FROM story_pages WHERE version_id = ? AND page_no = ?
                    ) WHERE version_id = ? AND page_no = ?""",
-                (source_page, version_id, carried_page),
+                (src_version_id, source_page, version_id, carried_page),
             )
 
 
@@ -229,11 +229,16 @@ def test_continuation_switch_tc_fr17_04_and_idempotency(cont_env):
         assert len(starts) == 1
         assert db.execute("SELECT COUNT(*) FROM request_executions WHERE scope_type = 'SESSION_CREATE'").fetchone() == (1,)
 
-    # Same key with changed body -> 409 IDEMPOTENCY_CONFLICT; new key -> 409 SESSION_CONFLICT.
+    # A changed body conflicts with the original key. A new key reports the completed switch.
     assert first.post("/api/v1/reading-sessions", headers=h1,
                       json={**switch_body, "expectedRevision": 3}).json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
-    assert first.post("/api/v1/reading-sessions", headers=h1,
-                      json={**switch_body, "clientRequestId": "switch-002"}).json()["error"]["code"] == "SESSION_CONFLICT"
+    repeat_switch_body = {**switch_body, "clientRequestId": "switch-002"}
+    already_switched = first.post("/api/v1/reading-sessions", headers=h1, json=repeat_switch_body)
+    assert already_switched.status_code == 409
+    assert already_switched.json()["error"]["code"] == "CONTINUATION_ALREADY_SWITCHED"
+    replayed_failure = first.post("/api/v1/reading-sessions", headers=h1, json=repeat_switch_body)
+    assert replayed_failure.status_code == 409
+    assert replayed_failure.json()["error"] == already_switched.json()["error"]
 
     chosen = first.post(f"/api/v1/reading-sessions/{sid2}/branches", headers=h1, json={
         "branchId": 901, "expectedRevision": 1, "clientEventId": "b-cont",
@@ -241,8 +246,28 @@ def test_continuation_switch_tc_fr17_04_and_idempotency(cont_env):
     assert chosen.status_code == 201 and chosen.json()["data"]["currentPage"] == 4
     assert chosen.json()["data"]["visitedPageNumbers"] == [1, 2, 3, 4]
 
+    other_failure = first.post("/api/v1/reading-sessions", headers=h1, json={
+        **switch_body, "sourceReadingSessionId": sid2, "clientRequestId": "switch-003",
+    })
+    assert other_failure.status_code == 409
+    assert other_failure.json()["error"]["code"] == "SESSION_CONFLICT"
+
     # Deleting source session clears its ID and preserves successor recovery metadata.
+    with closing(sqlite3.connect(db_path)) as db:
+        assert db.execute(
+            "SELECT status FROM request_executions WHERE scope_type = 'SESSION_CREATE' AND client_request_id = ?",
+            ("switch-002",),
+        ).fetchone() == ("FAILED",)
     assert first.delete(f"/api/v1/reading-sessions/{sid1}", headers=h1).status_code == 204
+    with closing(sqlite3.connect(db_path)) as db:
+        assert db.execute(
+            "SELECT status FROM request_executions WHERE scope_type = 'SESSION_CREATE' AND client_request_id = ?",
+            ("switch-002",),
+        ).fetchone() is None
+        assert db.execute(
+            "SELECT status FROM request_executions WHERE scope_type = 'SESSION_CREATE' AND client_request_id = ?",
+            ("switch-003",),
+        ).fetchone() == ("FAILED",)
     restored = first.get(f"/api/v1/reading-sessions/{sid2}").json()["data"]["session"]
     assert "sourceReadingSessionId" not in restored
     assert restored["storyVersionId"] == 302
@@ -297,7 +322,7 @@ def test_continuation_switch_stale_snapshot_and_atomic_rollback_tc_fr17_05(cont_
         "eventType": "PAGE_CHANGED", "pageNumber": 3, "expectedRevision": 2, "clientEventId": "e3",
     }).status_code == 201
     stale = first.post("/api/v1/reading-sessions", headers=h1, json=switch_body)
-    assert stale.status_code == 409 and stale.json()["error"]["code"] == "SESSION_CONFLICT"
+    assert stale.status_code == 409 and stale.json()["error"]["code"] == "CONTINUATION_STALE"
     assert first.get(f"/api/v1/reading-sessions/{sid1}").json()["data"]["session"]["status"] == "IN_PROGRESS"
     # Source session can still continue to page 4 normally.
     assert first.post(f"/api/v1/reading-sessions/{sid1}/events", headers=h1, json={
@@ -349,6 +374,63 @@ def test_continuation_switch_from_branched_source_renumbers_carried_prefix(cont_
     assert data["carriedPrefixPageCount"] == 2 and data["startPageNumber"] == 3
     old_report = first.get(f"/api/v1/reading-sessions/{sid1}").json()["data"]["report"]
     assert "第 1、3 页" in old_report["summary"]
+
+
+@pytest.mark.parametrize("ending", ["finish", "switch"])
+def test_continuation_first_page_event_reuses_creation_key_and_report_counts_new_pages(cont_env, monkeypatch, ending):
+    first, _, db_path, pid = cont_env
+    monkeypatch.setattr(app.state, "model_adapter", None, raising=False)
+    headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
+    sessions = "/api/v1/reading-sessions"
+    created = first.post(sessions, headers=headers, json={
+        "childProfileId": pid, "storyVersionId": 301, "mode": "PARENT_CHILD",
+    })
+    assert created.status_code == 201
+    source_id = created.json()["data"]["readingSessionId"]
+    source = f"{sessions}/{source_id}"
+    assert first.post(f"{source}/events", headers=headers, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start-source",
+    }).status_code == 201
+    _seed_continuation_draft(db_path, 302, 2, source_id, 1, 1, [1])
+    assert first.post("/api/v1/story-versions/302/approvals", headers=headers, json={
+        "versionNumber": 2, "reviewedAllBranches": True,
+    }).status_code == 200
+
+    request_key = "continuation-request"
+    switched = first.post(sessions, headers=headers, json={
+        "childProfileId": pid, "storyVersionId": 302, "mode": "PARENT_CHILD",
+        "sourceReadingSessionId": source_id, "expectedRevision": 1, "clientRequestId": request_key,
+    })
+    assert switched.status_code == 201
+    successor_id = switched.json()["data"]["readingSessionId"]
+    successor = f"{sessions}/{successor_id}"
+    page_event = {
+        "eventType": "PAGE_CHANGED", "pageNumber": 3, "expectedRevision": 1, "clientEventId": request_key,
+    }
+    advanced = first.post(f"{successor}/events", headers=headers, json=page_event)
+    assert advanced.status_code == 201
+    assert first.get(successor).json()["data"]["session"]["visitedPageNumbers"] == [1, 2, 3]
+    replayed = first.post(f"{successor}/events", headers=headers, json=page_event)
+    assert replayed.status_code == 200 and replayed.json()["data"] == advanced.json()["data"]
+
+    assert first.delete(source, headers=headers).status_code == 204
+    if ending == "finish":
+        finished = first.post(f"{successor}/completions", headers=headers, json={
+            "reason": "USER_FINISH", "expectedRevision": 2, "clientEventId": "finish-successor",
+        })
+        assert finished.status_code == 200
+    else:
+        _seed_continuation_draft(db_path, 303, 3, successor_id, 2, 3, [1, 2, 3], src_version_id=302)
+        assert first.post("/api/v1/story-versions/303/approvals", headers=headers, json={
+            "versionNumber": 3, "reviewedAllBranches": True,
+        }).status_code == 200
+        next_switch = first.post(sessions, headers=headers, json={
+            "childProfileId": pid, "storyVersionId": 303, "mode": "PARENT_CHILD",
+            "sourceReadingSessionId": successor_id, "expectedRevision": 2, "clientRequestId": "next-continuation",
+        })
+        assert next_switch.status_code == 201
+    report = first.get(successor).json()["data"]["report"]
+    assert report["summary"] == "本次共读阅读了第 2、3 页。"
 
 
 def test_approval_enforces_backend_safety_freezes_media_and_handles_dependency_recovery(cont_env, tmp_path, monkeypatch):
