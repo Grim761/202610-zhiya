@@ -161,6 +161,259 @@ def test_original_generation_checks_and_persists_only_valid_drafts(cont_env, mon
     assert approved.status_code == 200, approved.text
 
 
+def test_story_generation_validation_limits_and_mode_guards(cont_env, monkeypatch):
+    client, _, db_path, profile = cont_env
+    headers = {"X-CSRF-Token": client.cookies["zhiya_csrf"]}
+    calls = []
+
+    class StoryModel:
+        async def generate(self, request):
+            calls.append(json.loads(request.context_text))
+            return ModelGenerateResult(success=True, text=json.dumps({
+                "title": "三页后续分支",
+                "pages": ["来到分岔路口。", "向左走遇见松鼠。", "一起安全回家。"],
+                "choices": ["向左走", "直接回家"],
+            }))
+
+    # Anonymous and missing CSRF fail closed before reaching generation.
+    with TestClient(app, base_url="https://testserver") as anon:
+        assert anon.post("/api/v1/story-generations", json={
+            "ageBand": "AGE_4_5", "topic": "互助", "characters": ["小兔"], "scene": "森林",
+            "branching": False, "clientRequestId": "anon-1",
+        }).status_code == 401
+    monkeypatch.setattr(client.app.state, "model_adapter", StoryModel())
+    assert client.post("/api/v1/story-generations", json={
+        "ageBand": "AGE_4_5", "topic": "互助", "characters": ["小兔"], "scene": "森林",
+        "branching": False, "clientRequestId": "nocsrf-1",
+    }).status_code == 403
+
+    # Mutually exclusive / explicit-null ageBand vs continuation fields -> 422.
+    for bad in (
+        {"ageBand": None, "topic": "互助", "characters": ["小兔"], "scene": "森林", "branching": False, "clientRequestId": "b1"},
+        {"ageBand": "AGE_4_5", "sourceReadingSessionId": 1, "expectedRevision": 1, "topic": "互助", "characters": ["小兔"], "scene": "森林", "branching": False, "clientRequestId": "b2"},
+        {"topic": "互助", "characters": ["小兔"], "scene": "森林", "branching": False, "clientRequestId": "b3"},
+    ):
+        assert client.post("/api/v1/story-generations", headers=headers, json=bad).status_code == 422
+
+    # Sensitive input fails with 422 before calling the model, and same-key mismatch returns IDEMPOTENCY_CONFLICT.
+    sensitive_req = {"ageBand": "AGE_4_5", "topic": "互助", "characters": ["小兔"], "scene": "询问家庭地址",
+                     "branching": False, "clientRequestId": "sens-1"}
+    assert client.post("/api/v1/story-generations", headers=headers, json=sensitive_req).status_code == 422
+    assert client.post("/api/v1/story-generations", headers=headers, json=sensitive_req).status_code == 422
+    assert client.post("/api/v1/story-generations", headers=headers,
+                       json={**sensitive_req, "scene": "森林"}).json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+    # LIBRARY session cannot be continued (404).
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("PRAGMA foreign_keys = ON")
+        db.execute("INSERT INTO storybooks VALUES (299, NULL, 'LIBRARY', 1)")
+        db.execute("""INSERT INTO story_versions
+            (id, storybook_id, version_no, title, topics_json, age_min, age_max,
+             license_note, status, reviewed_by_id, reviewed_at, created_at, branching)
+            VALUES (399, 299, 1, '馆藏绘本', '["互助"]', 3, 5, '馆藏授权', 'PUBLISHED', 1, 100, 1, 0)""")
+        for pno, nxt in ((1, 2), (2, 3), (3, 4), (4, None)):
+            db.execute("INSERT INTO story_pages (version_id, page_no, body_text, image_ref, default_next_page_number) VALUES (399, ?, '馆藏页', 'none', ?)",
+                       (pno, nxt))
+    lib_sid = client.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile, "storyVersionId": 399, "mode": "PARENT_CHILD",
+    }).json()["data"]["readingSessionId"]
+    assert client.post(f"/api/v1/reading-sessions/{lib_sid}/events", headers=headers, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "lib-s1",
+    }).status_code == 201
+    assert client.post("/api/v1/story-generations", headers=headers, json={
+        "sourceReadingSessionId": lib_sid, "expectedRevision": 1, "topic": "互助",
+        "characters": ["小兔"], "scene": "森林", "branching": False, "clientRequestId": "lib-cont",
+    }).status_code == 404
+
+    # Advance an ORIGINAL session to 3 pages -> branching=True succeeds with 6 total pages (decision=4 -> 5, 6).
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE story_pages SET default_next_page_number = 5 WHERE version_id = 301 AND page_no = 4")
+        db.execute("INSERT INTO story_pages (version_id, page_no, body_text, image_ref, default_next_page_number) VALUES (301, 5, 'v1第5页', 'none', 6)")
+        db.execute("INSERT INTO story_pages (version_id, page_no, body_text, image_ref, default_next_page_number) VALUES (301, 6, 'v1第6页', 'none', NULL)")
+    sid = client.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile, "storyVersionId": 301, "mode": "PARENT_CHILD",
+    }).json()["data"]["readingSessionId"]
+    for page, event in ((1, "STARTED"), (2, "PAGE_CHANGED"), (3, "PAGE_CHANGED")):
+        assert client.post(f"/api/v1/reading-sessions/{sid}/events", headers=headers, json={
+            "eventType": event, "pageNumber": page, "expectedRevision": page - 1, "clientEventId": f"p-{page}",
+        }).status_code == 201
+    assert len(calls) == 0
+
+    ok_branch = client.post("/api/v1/story-generations", headers=headers, json={
+        "sourceReadingSessionId": sid, "expectedRevision": 3, "topic": "互助",
+        "characters": ["小兔"], "scene": "森林", "branching": True, "clientRequestId": "branch-at-3",
+    })
+    assert ok_branch.status_code == 201, ok_branch.text
+    assert [(b["fromPageNumber"], b["nextPageNumber"]) for b in ok_branch.json()["data"]["branches"]] == [(4, 5), (4, 6)]
+    assert len(calls) == 1
+
+    # Advance to page 4 -> branching=True hits 422 CONTINUATION_LIMIT without calling the model.
+    assert client.post(f"/api/v1/reading-sessions/{sid}/events", headers=headers, json={
+        "eventType": "PAGE_CHANGED", "pageNumber": 4, "expectedRevision": 3, "clientEventId": "p-4",
+    }).status_code == 201
+    limit_branch = client.post("/api/v1/story-generations", headers=headers, json={
+        "sourceReadingSessionId": sid, "expectedRevision": 4, "topic": "互助",
+        "characters": ["小兔"], "scene": "森林", "branching": True, "clientRequestId": "limit-branch-4",
+    })
+    assert limit_branch.status_code == 422 and limit_branch.json()["error"]["code"] == "CONTINUATION_LIMIT"
+    assert len(calls) == 1
+
+    # Advance to page 6 -> branching=False also hits 422 CONTINUATION_LIMIT.
+    for page in (5, 6):
+        assert client.post(f"/api/v1/reading-sessions/{sid}/events", headers=headers, json={
+            "eventType": "PAGE_CHANGED", "pageNumber": page, "expectedRevision": page - 1, "clientEventId": f"p-{page}",
+        }).status_code == 201
+    limit_linear = client.post("/api/v1/story-generations", headers=headers, json={
+        "sourceReadingSessionId": sid, "expectedRevision": 6, "topic": "互助",
+        "characters": ["小兔"], "scene": "森林", "branching": False, "clientRequestId": "limit-linear-6",
+    })
+    assert limit_linear.status_code == 422 and limit_linear.json()["error"]["code"] == "CONTINUATION_LIMIT"
+    assert len(calls) == 1
+
+    # Child-mode device cannot call API-025 (403 FORBIDDEN).
+    with TestClient(app, base_url="https://testserver") as child_client:
+        creds = {"account": "guardian-child-check", "password": "strong-pass-123"}
+        assert child_client.post("/api/v1/auth/registrations", json=creds).status_code == 201
+        assert child_client.post("/api/v1/auth/sessions", json=creds).status_code == 201
+        ch = {"X-CSRF-Token": child_client.cookies["zhiya_csrf"]}
+        cpid = child_client.post("/api/v1/child-profiles", headers=ch,
+                                 json={"ageBand": "AGE_4_5", "preferredMinutes": 10}).json()["data"]["childProfileId"]
+        csid = child_client.post("/api/v1/reading-sessions", headers=ch, json={
+            "childProfileId": cpid, "storyVersionId": 399, "mode": "PARENT_CHILD",
+        }).json()["data"]["readingSessionId"]
+        assert child_client.put(f"/api/v1/reading-sessions/{csid}/mode-settings", headers=ch, json={
+            "mode": "CHILD_SOLO", "allowedStoryVersionIds": [399], "timeLimitSeconds": 300,
+        }).status_code == 200
+        child_csrf = {"X-CSRF-Token": child_client.cookies["zhiya_csrf"]}
+        forbidden = child_client.post("/api/v1/story-generations", headers=child_csrf, json={
+            "ageBand": "AGE_4_5", "topic": "互助", "characters": ["小兔"], "scene": "森林",
+            "branching": False, "clientRequestId": "child-attempt",
+        })
+        assert forbidden.status_code == 403 and forbidden.json()["error"]["code"] == "FORBIDDEN"
+
+
+def test_story_generation_execution_lifecycle_fenced_json_and_race_guards(cont_env, monkeypatch, tmp_path):
+    from PIL import Image
+
+    client, _, db_path, profile = cont_env
+    headers = {"X-CSRF-Token": client.cookies["zhiya_csrf"]}
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(media_root))
+    cover = media_root / "branch3.png"
+    Image.new("RGB", (4, 4), "blue").save(cover)
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE story_versions SET branching = 1 WHERE id = 301")
+        db.execute("INSERT INTO story_branches VALUES (801, 301, 1, 3, '走近路', 'APPROVED')")
+        db.execute("UPDATE story_pages SET image_ref = 'branch3.png' WHERE version_id = 301 AND page_no = 3")
+
+    sid = client.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile, "storyVersionId": 301, "mode": "PARENT_CHILD",
+    }).json()["data"]["readingSessionId"]
+    assert client.post(f"/api/v1/reading-sessions/{sid}/events", headers=headers, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "r1",
+    }).status_code == 201
+    assert client.post(f"/api/v1/reading-sessions/{sid}/branches", headers=headers, json={
+        "branchId": 801, "expectedRevision": 1, "clientEventId": "r2",
+    }).status_code == 201
+
+    mode = {"value": "timeout"}
+    calls = 0
+
+    class ScriptedModel:
+        async def generate(self, request):
+            nonlocal calls
+            calls += 1
+            if mode["value"] == "timeout":
+                return ModelGenerateResult(success=False, error_code="TIMEOUT")
+            if mode["value"] == "api_error":
+                return ModelGenerateResult(success=False, error_code="API_ERROR")
+            if mode["value"] == "expire_during_call":
+                with closing(sqlite3.connect(db_path)) as db, db:
+                    db.execute(
+                        "UPDATE request_executions SET started_at = 1, deadline_at = 2 WHERE client_request_id = 'exp-1'",
+                    )
+                return ModelGenerateResult(success=True, text=json.dumps({
+                    "title": "超时落地", "pages": ["新第3页", "新第4页"],
+                }))
+            if mode["value"] == "advance_during_call":
+                with closing(sqlite3.connect(db_path)) as db, db:
+                    db.execute(
+                        "UPDATE reading_sessions SET current_page_no = 4, revision = 3, visited_pages_json = '[1,3,4]' WHERE id = ?",
+                        (sid,),
+                    )
+                return ModelGenerateResult(success=True, text=json.dumps({
+                    "title": "中途过期的续写", "pages": ["新第3页", "新第4页"],
+                }))
+            return ModelGenerateResult(
+                success=True,
+                text='```json\n{"title": "小路新发现", "pages": ["来到小木桥。", "一起过小桥。"]}\n```',
+            )
+
+    monkeypatch.setattr(client.app.state, "model_adapter", ScriptedModel())
+    base_req = {
+        "sourceReadingSessionId": sid, "expectedRevision": 2, "topic": "互助",
+        "characters": ["小狐狸"], "scene": "森林", "branching": False,
+    }
+
+    # 1. Timeout records UNKNOWN and replays 504 without calling the model again.
+    timed_out = client.post("/api/v1/story-generations", headers=headers, json={**base_req, "clientRequestId": "to-1"})
+    assert timed_out.status_code == 504 and timed_out.json()["error"]["code"] == "REQUEST_OUTCOME_UNKNOWN"
+    assert client.post("/api/v1/story-generations", headers=headers, json={**base_req, "clientRequestId": "to-1"}).status_code == 504
+    assert calls == 1
+
+    # 2. API_ERROR records FAILED 503 and replays 503 without calling the model again.
+    mode["value"] = "api_error"
+    dep_err = client.post("/api/v1/story-generations", headers=headers, json={**base_req, "clientRequestId": "err-1"})
+    assert dep_err.status_code == 503 and dep_err.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+    assert client.post("/api/v1/story-generations", headers=headers, json={**base_req, "clientRequestId": "err-1"}).status_code == 503
+    assert calls == 2
+
+    # 3. Missing media root fails closed before calling model (retryable=True) and recovers once restored.
+    offline_root = tmp_path / "media-offline"
+    media_root.rename(offline_root)
+    media_down = client.post("/api/v1/story-generations", headers=headers, json={**base_req, "clientRequestId": "fenced-1"})
+    assert media_down.status_code == 503 and media_down.json()["error"]["retryable"] is True
+    assert calls == 2
+    offline_root.rename(media_root)
+
+    # 4. Markdown-fenced JSON succeeds on retry with the same key and preserves branched carried media.
+    mode["value"] = "fenced"
+    ok = client.post("/api/v1/story-generations", headers=headers, json={**base_req, "clientRequestId": "fenced-1"})
+    assert ok.status_code == 201, ok.text
+    assert calls == 3
+    odata = ok.json()["data"]
+    assert odata["continuation"]["sourceVisitedPageNumbers"] == [1, 3]
+    assert odata["continuation"]["resumePageNumber"] == 3
+    assert odata["pages"][1]["imageRef"] == "asset-301-page-3"
+
+    # 5. Exceeding the execution deadline during model generation marks the execution UNKNOWN (504).
+    mode["value"] = "expire_during_call"
+    expired = client.post("/api/v1/story-generations", headers=headers, json={**base_req, "clientRequestId": "exp-1"})
+    assert expired.status_code == 504 and expired.json()["error"]["code"] == "REQUEST_OUTCOME_UNKNOWN"
+    with closing(sqlite3.connect(db_path)) as db:
+        assert db.execute(
+            "SELECT status FROM request_executions WHERE client_request_id = 'exp-1'",
+        ).fetchone()[0] == "UNKNOWN"
+
+    # 6. If source advances while the model is running, finish_generation returns 409 CONTINUATION_STALE without saving a draft.
+    mode["value"] = "advance_during_call"
+    raced = client.post("/api/v1/story-generations", headers=headers, json={**base_req, "clientRequestId": "race-1"})
+    assert raced.status_code == 409 and raced.json()["error"]["code"] == "CONTINUATION_STALE"
+    assert client.post("/api/v1/story-generations", headers=headers, json={**base_req, "clientRequestId": "race-1"}).status_code == 409
+    assert client.post("/api/v1/story-generations", headers=headers,
+                       json={**base_req, "expectedRevision": 3, "clientRequestId": "race-1"}).json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    with closing(sqlite3.connect(db_path)) as db:
+        # Only version 301 and the valid draft from step 4 exist.
+        assert db.execute("SELECT COUNT(*) FROM story_versions").fetchone()[0] == 2
+
+    # 7. Deleting source session cleans up associated STORY_GENERATION request_executions rows.
+    assert client.delete(f"/api/v1/reading-sessions/{sid}", headers=headers).status_code == 204
+    with closing(sqlite3.connect(db_path)) as db:
+        assert db.execute("SELECT COUNT(*) FROM request_executions WHERE scope_type = 'STORY_GENERATION'").fetchone()[0] == 0
+
+
+
 def _seed_continuation_draft(db_path: Path, version_id: int, version_no: int, src_session_id: int,
                              src_revision: int, src_page: int, prefix: list[int], *,
                              status: str = "PENDING_REVIEW", branching: int = 0, src_version_id: int = 301):

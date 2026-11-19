@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import sqlite3
 import time
 import unicodedata
@@ -13,7 +14,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from app.api.v1.auth import authorized_db, error
-from app.api.v1.reading_sessions import MAX_ID, replay_execution, request_digest
+from app.api.v1.reading_sessions import MAX_ID, fail_execution, replay_execution, request_digest
 from app.api.v1.storybooks import AGES, AgeBand, _verify_version_for_approval
 from app.schemas.agent import ModelGenerateRequest
 from app.services.reading_agent import SENSITIVE
@@ -21,6 +22,7 @@ from app.services.story_media import MediaDependencyError, page_image_ref_from_m
 
 
 router = APIRouter(prefix="/api/v1")
+logger = logging.getLogger("zhiya.story_generations")
 PATH = "/api/v1/story-generations"
 SCOPE = "STORY_GENERATION"
 ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
@@ -65,7 +67,8 @@ def source_session(db, owner, session_id):
            JOIN story_versions v ON v.id = s.version_id JOIN storybooks b ON b.id = v.storybook_id
            WHERE s.id = ? AND p.guardian_id = ? AND b.owner_guardian_id = ?
              AND b.source_type = 'ORIGINAL' AND s.mode = 'PARENT_CHILD'
-             AND v.status IN ('APPROVED_PRIVATE', 'RETIRED')""",
+             AND (v.status = 'APPROVED_PRIVATE'
+                  OR (v.status = 'RETIRED' AND v.reviewed_by_id IS NOT NULL AND v.reviewed_at IS NOT NULL))""",
         (session_id, owner, owner),
     ).fetchone()
 
@@ -78,6 +81,15 @@ def page_plan(prefix_length: int, branching: bool) -> tuple[int, int | None]:
     return max(5, decision + 2), decision
 
 
+def _extract_json_text(raw: str) -> str:
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3 and lines[0].strip().lower() in ("```", "```json") and lines[-1].strip() == "```":
+            return "\n".join(lines[1:-1]).strip()
+    return text
+
+
 def reserve_generation(request, payload, digest):
     with authorized_db(request, write=True, guardian_only=True) as (db, principal, failure):
         if failure:
@@ -87,27 +99,48 @@ def reserve_generation(request, payload, digest):
         source = source_session(db, owner, source_id) if source_id is not None else None
         if source_id is not None and source is None:
             return error(request, 404, "RESOURCE_NOT_FOUND", "可续写的原创亲子会话不可用")
-        replay = replay_execution(db, request, SCOPE, owner, payload.clientRequestId, digest)
+        replay = replay_execution(
+            db, request, SCOPE, owner, payload.clientRequestId, digest, source_session_id=source_id,
+        )
         if replay is not None:
             return replay
         prefix = []
         if source is not None:
             if source["status"] != "IN_PROGRESS" or source["revision"] != payload.expectedRevision:
-                return error(request, 409, "CONTINUATION_STALE", "源会话进度已更新")
+                return fail_execution(
+                    db, request, owner, SCOPE, owner, None, payload.clientRequestId, digest,
+                    409, "CONTINUATION_STALE", "源会话进度已更新", source_session_id=source_id,
+                )
             prefix = json.loads(source["visited_pages_json"])
         total, decision = page_plan(len(prefix), payload.branching)
         if total > 6:
-            return error(request, 422, "CONTINUATION_LIMIT", "已读页数超出可续写范围")
+            return fail_execution(
+                db, request, owner, SCOPE, owner, None, payload.clientRequestId, digest,
+                422, "CONTINUATION_LIMIT", "已读页数超出可续写范围", source_session_id=source_id,
+            )
         carried_pages = []
         if source is not None:
             source_pages = {p["page_no"]: p for p in db.execute(
                 "SELECT * FROM story_pages WHERE version_id = ?", (source["version_id"],),
             )}
+            if not prefix or prefix[0] != 1 or prefix[-1] != source["current_page_no"] or any(
+                number not in source_pages for number in prefix
+            ):
+                return fail_execution(
+                    db, request, owner, SCOPE, owner, None, payload.clientRequestId, digest,
+                    409, "CONTINUATION_STALE", "源会话进度不可用", source_session_id=source_id,
+                )
             carried_pages = [source_pages[number] for number in prefix]
         if any(SENSITIVE.search(unicodedata.normalize("NFKC", value)) for value in (
             payload.topic, payload.scene, *payload.characters, *(page["body_text"] for page in carried_pages),
         )):
-            return error(request, 422, "VALIDATION_ERROR", "绘本输入未通过内容检查")
+            return fail_execution(
+                db, request, owner, SCOPE, owner, None, payload.clientRequestId, digest,
+                422, "VALIDATION_ERROR", "绘本输入未通过内容检查", source_session_id=source_id,
+            )
+        if source is not None:
+            source_version = db.execute("SELECT * FROM story_versions WHERE id = ?", (source["version_id"],)).fetchone()
+            pin_version_media(db, source_version, source_type="ORIGINAL")
         token = str(uuid4())
         now = int(time.time() * 1000)
         db.execute(
@@ -138,15 +171,18 @@ async def generate_text(request, payload, source, carried_pages, total, decision
         '新增页数须精确等于 newPageCount。decisionPage 为 null 时 choices 为空。'
         '有决策页时恰有两个选项，第一个读下一页，第二个跳过下一页；两条路线随后汇合，均须能读懂结局。'
     )
+    adapter = getattr(request.app.state, "model_adapter", None)
+    if adapter is None:
+        raise RuntimeError("model adapter unavailable")
     async with asyncio.timeout(60):
-        result = await request.app.state.model_adapter.generate(ModelGenerateRequest(
+        result = await adapter.generate(ModelGenerateRequest(
             system_prompt=prompt, context_text=json.dumps(context, ensure_ascii=False), user_input="生成绘本文字草稿",
         ))
     if not result.success:
         if result.error_code == "TIMEOUT":
             raise TimeoutError
         raise RuntimeError("model response unavailable")
-    draft = GeneratedText.model_validate_json(result.text)
+    draft = GeneratedText.model_validate_json(_extract_json_text(result.text))
     if len(draft.pages) != count or len(set(draft.choices)) != (2 if decision else 0):
         raise ValueError("generated draft does not match page plan")
     if decision is None and draft.choices:
@@ -190,7 +226,7 @@ def save_draft(db, request, payload, owner, source, carried_pages, total, decisi
             branching, source_version_id, source_session_id, source_revision, source_page_no, resume_page_no,
             source_visited_pages_json)
            VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING_REVIEW', ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (book_id, number, draft.title, json.dumps([payload.topic]), *AGES[age_band], license_note,
+        (book_id, number, draft.title, json.dumps([payload.topic], ensure_ascii=False), *AGES[age_band], license_note,
          now, int(payload.branching), *snapshot),
     ).lastrowid
     pages = []
@@ -229,7 +265,7 @@ def save_draft(db, request, payload, owner, source, carried_pages, total, decisi
     }, "requestId": request.state.request_id})
 
 
-def finish_generation(request, payload, reserved, result, execution_status):
+def finish_generation(request, payload, digest, reserved, result, execution_status):
     owner, token, source, carried_pages, total, decision = reserved
     with authorized_db(request, write=True, guardian_only=True) as (db, principal, failure):
         if failure:
@@ -237,17 +273,42 @@ def finish_generation(request, payload, reserved, result, execution_status):
         if principal.guardian_id != owner:
             return error(request, 404, "RESOURCE_NOT_FOUND", "生成请求不可用")
         key = (SCOPE, owner, payload.clientRequestId)
+        now = int(time.time() * 1000)
         execution = db.execute(
             """SELECT id, deadline_at FROM request_executions
                WHERE scope_type = ? AND scope_id = ? AND client_request_id = ?
                  AND execution_token = ? AND status = 'RUNNING'""", (*key, token),
         ).fetchone()
-        now = int(time.time() * 1000)
-        if execution is None or execution["deadline_at"] <= now:
+        if execution is None:
+            if source is not None and source_session(db, owner, source["id"]) is None:
+                return error(request, 404, "RESOURCE_NOT_FOUND", "可续写的原创亲子会话不可用")
+            same_attempt = db.execute(
+                """SELECT 1 FROM request_executions
+                   WHERE scope_type = ? AND scope_id = ? AND client_request_id = ? AND execution_token = ?""",
+                (*key, token),
+            ).fetchone()
+            if same_attempt:
+                return replay_execution(
+                    db, request, SCOPE, owner, payload.clientRequestId, digest,
+                    source_session_id=source["id"] if source is not None else None,
+                )
             return error(request, 504, "REQUEST_OUTCOME_UNKNOWN", "生成结果未知")
+        if execution["deadline_at"] <= now:
+            unknown = error(request, 504, "REQUEST_OUTCOME_UNKNOWN", "生成结果未知")
+            db.execute(
+                """UPDATE request_executions SET status = 'UNKNOWN', completed_at = ?, response_status = 504,
+                   response_body = ? WHERE id = ? AND status = 'RUNNING'""",
+                (now, unknown.body.decode(), execution["id"]),
+            )
+            return unknown
         if source is not None:
             current = source_session(db, owner, source["id"])
-            if current is None or current["status"] != "IN_PROGRESS" or current["revision"] != source["revision"]:
+            if current is None:
+                result = error(request, 404, "RESOURCE_NOT_FOUND", "可续写的原创亲子会话不可用")
+                execution_status = "FAILED"
+            elif execution_status == "SUCCEEDED" and (
+                current["status"] != "IN_PROGRESS" or current["revision"] != source["revision"]
+            ):
                 result = error(request, 409, "CONTINUATION_STALE", "源会话进度已更新")
                 execution_status = "FAILED"
         if execution_status == "SUCCEEDED":
@@ -255,7 +316,7 @@ def finish_generation(request, payload, reserved, result, execution_status):
             try:
                 result = save_draft(db, request, payload, owner, source, carried_pages, total, decision, result, now)
             except MediaDependencyError:
-                result = error(request, 503, "DEPENDENCY_UNAVAILABLE", "绘本媒体暂不可用", retryable=True)
+                result = error(request, 503, "DEPENDENCY_UNAVAILABLE", "绘本媒体暂不可用")
             if result.status_code != 201:
                 db.execute("ROLLBACK TO draft")
                 execution_status = "FAILED"
@@ -272,6 +333,8 @@ async def generate_story(payload: StoryGeneration, request: Request):
     digest = request_digest(PATH, payload.model_dump())
     try:
         reserved = reserve_generation(request, payload, digest)
+    except MediaDependencyError:
+        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "绘本媒体暂不可用", retryable=True)
     except sqlite3.Error:
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "暂时无法开始生成", retryable=True)
     if isinstance(reserved, JSONResponse):
@@ -282,15 +345,19 @@ async def generate_story(payload: StoryGeneration, request: Request):
     except TimeoutError:
         status = "UNKNOWN"
         result = error(request, 504, "REQUEST_OUTCOME_UNKNOWN", "生成结果未知")
-    except ValueError:
+    except ValueError as exc:
+        logger.warning("story generation validation failed request_id=%s error=%s",
+                       request.state.request_id, type(exc).__name__)
         status = "FAILED"
         result = error(request, 422, "VALIDATION_ERROR", "生成内容不符合绘本要求")
-    except Exception:
+    except Exception as exc:
+        logger.warning("story generation failed request_id=%s error=%s",
+                       request.state.request_id, type(exc).__name__)
         status = "FAILED"
         result = error(request, 503, "DEPENDENCY_UNAVAILABLE", "生成服务暂不可用")
     for _ in range(2):
         try:
-            return finish_generation(request, payload, reserved, result, status)
+            return finish_generation(request, payload, digest, reserved, result, status)
         except sqlite3.Error:
             continue
     return error(request, 503, "DEPENDENCY_UNAVAILABLE", "暂时无法保存生成结果", retryable=True)
