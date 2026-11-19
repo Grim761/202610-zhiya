@@ -43,7 +43,9 @@ docker compose -f infra/compose.yaml run --rm backend python database/import_see
 docker compose -f infra/compose.yaml run --rm backend python database/init_db.py --check
 ```
 
-已有种子库升级时，请在替换旧图片或封面映射前，用原数据卷再次运行上面的种子导入命令。它会用当前素材补建缺失的版本快照，并保留已有快照。快照保存在 SQLite 文件旁，服务账号需要该目录的读写权限。
+已有种子库升级时，在更换原素材或封面映射前，用原数据卷再次运行上面的种子导入命令。导入会登记旧清单，只为尚未绑定且缺少清单的版本补建快照。首次固定时缺图的内页在该版本中持续显示占位。
+
+备份和恢复 SQLite 文件时，一起保存同目录的 `.<db_name>.media_pins/`（图片和版本清单）与 `.<db_name>.media_pins.bindings/`（各版本的清单摘要）。数据卷需支持同目录硬链接，并允许服务账号读写。已有绑定的清单或图片丢失时，受影响的接口返回可重试的 503。恢复对应快照后，可重试原请求。
 
 受控封面和内页接受 `.png`、`.jpg`、`.jpeg`、`.webp` 路径。API-024 按完整解码得到的格式返回 `Content-Type`。例如，后缀为 `.png` 的有效 JPEG 会以 `image/jpeg` 返回。
 

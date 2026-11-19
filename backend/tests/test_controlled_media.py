@@ -446,6 +446,138 @@ def test_cover_is_pinned_to_story_version_on_filename_reuse_and_mapping_replacem
     assert first.get("/api/v1/story-versions/31").json()["data"]["coverRef"] == "asset-31-cover"
 
 
+def _create_reading_session(client, version_id):
+    headers = {"X-CSRF-Token": client.cookies["zhiya_csrf"]}
+    profile = client.post("/api/v1/child-profiles", headers=headers,
+                          json={"ageBand": "AGE_3_4", "preferredMinutes": 10}).json()["data"]["childProfileId"]
+    response = client.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile, "storyVersionId": version_id, "mode": "PARENT_CHILD",
+    })
+    assert response.status_code == 201
+    return response.json()["data"]["readingSessionId"], headers
+
+
+def test_missing_page_stays_missing_when_a_new_version_reuses_its_path(media_env, monkeypatch):
+    first, _, db_path, root = media_env
+    monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(root))
+    _library_book(db_path, 20, 2, 1, ["later.png"], seed_cover=False)
+    _create_reading_session(first, 20)
+    assert first.get("/api/v1/media/asset-20-page-1").status_code == 404
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE story_versions SET status = 'RETIRED' WHERE id = 20")
+    (root / "later.png").write_bytes(PNG_BLUE)
+    _library_book(db_path, 21, 2, 2, ["later.png"], seed_cover=False)
+    assert first.get("/api/v1/media/asset-21-page-1").content == PNG_BLUE
+    assert first.get("/api/v1/story-versions/20").json()["data"]["pages"][0]["imageRef"] is None
+    assert first.get("/api/v1/media/asset-20-page-1").status_code == 404
+
+
+@pytest.mark.parametrize("missing", ["versions", "store"])
+def test_bound_version_waits_for_original_snapshot(media_env, monkeypatch, missing):
+    first, _, db_path, root = media_env
+    monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(root))
+    mapping = root / "covers.json"
+    mapping.write_text(json.dumps([{"storybook_id": 2, "cover_path": "cover.png"}]), encoding="utf-8")
+    monkeypatch.setenv("ZHIYA_COVER_MAPPING_PATH", str(mapping))
+    source = root / "cover.png"
+    source.write_bytes(PNG_RED)
+    _library_book(db_path, 20, 2, 1, ["none"])
+    assert first.get("/api/v1/media/asset-20-cover").content == PNG_RED
+    _create_reading_session(first, 20)
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE story_versions SET status = 'RETIRED' WHERE id = 20")
+    source.write_bytes(PNG_BLUE)
+    _library_book(db_path, 21, 2, 2, ["none"])
+    assert first.get("/api/v1/media/asset-21-cover").content == PNG_BLUE
+
+    store = db_path.parent / f".{db_path.name}.media_pins"
+    unavailable = store / "versions" if missing == "versions" else store
+    backup = unavailable.rename(root / "offline")
+    for url in ("/api/v1/media/asset-20-cover", "/api/v1/story-versions/20", "/api/v1/storybooks"):
+        response = first.get(url)
+        assert response.status_code == 503, url
+        assert response.json()["error"]["retryable"] is True
+    assert not unavailable.exists()
+    backup.rename(unavailable)
+    assert first.get("/api/v1/media/asset-20-cover").content == PNG_RED
+    assert first.get("/api/v1/media/asset-21-cover").content == PNG_BLUE
+
+
+def test_offline_pinned_blob_preserves_branch_progress_and_retry(media_env, monkeypatch):
+    first, _, db_path, root = media_env
+    monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(root))
+    (root / "page.png").write_bytes(PNG_RED)
+    _library_book(db_path, 20, 2, 1, ["none", "none", "page.png"], seed_cover=False, branching=1)
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("""INSERT INTO story_branches
+            (id, version_id, from_page_no, next_page_no, choice_label, review_status)
+            VALUES (90, 20, 1, 3, '去公园', 'APPROVED')""")
+    sid, headers = _create_reading_session(first, 20)
+    session = f"/api/v1/reading-sessions/{sid}"
+    assert first.post(f"{session}/events", headers=headers, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start",
+    }).status_code == 201
+    image = "/api/v1/media/asset-20-page-3"
+    assert first.get(image).content == PNG_RED
+    blobs = db_path.parent / f".{db_path.name}.media_pins" / "blobs"
+    backup = blobs.rename(root / "offline")
+    payload = {"branchId": 90, "expectedRevision": 1, "clientEventId": "choose"}
+    branch = first.post(f"{session}/branches", headers=headers, json=payload)
+    for response in (branch, first.get(image), first.get("/api/v1/story-versions/20"), first.get("/api/v1/storybooks")):
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+        assert response.json()["error"]["retryable"] is True
+    state = first.get(session).json()["data"]["session"]
+    assert (state["currentPage"], state["revision"]) == (1, 1)
+    backup.rename(blobs)
+    for status in (201, 200):
+        retried = first.post(f"{session}/branches", headers=headers, json=payload)
+        assert retried.status_code == status
+        assert retried.json()["data"]["nextPage"]["imageRef"] == "asset-20-page-3"
+        assert retried.json()["data"]["revision"] == 2
+
+
+def test_warm_shelf_skips_blob_payloads_and_detects_replacement(media_env, monkeypatch):
+    first, _, db_path, root = media_env
+    monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(root))
+    (root / "page.png").write_bytes(PNG_RED)
+    _library_book(db_path, 20, 2, 1, ["page.png"], seed_cover=False)
+    shelf = "/api/v1/storybooks"
+    image = "/api/v1/media/asset-20-page-1"
+    assert first.get(shelf).json()["data"]["items"][0]["pages"][0]["imageRef"] == "asset-20-page-1"
+
+    bytes_read = []
+    open_path = Path.open
+
+    def count_blob_reads(path, *args, **kwargs):
+        stream = open_path(path, *args, **kwargs)
+        if path.parent.name == "blobs" and stream.readable():
+            read = stream.read
+
+            def counted_read(*read_args):
+                data = read(*read_args)
+                bytes_read.append(len(data))
+                return data
+
+            stream.read = counted_read
+        return stream
+
+    monkeypatch.setattr(Path, "open", count_blob_reads)
+    assert first.get(shelf).status_code == 200
+    assert bytes_read == []
+    assert first.get(image).content == PNG_RED
+    assert sum(bytes_read) == len(PNG_RED)
+
+    blob, = (db_path.parent / f".{db_path.name}.media_pins" / "blobs").iterdir()
+    replacement = root / "replacement.png"
+    replacement.write_bytes(PNG_BLUE)
+    replacement.replace(blob)
+    assert first.get(shelf).status_code == 503
+    assert first.get(image).status_code == 503
+    blob.write_bytes(PNG_RED)
+    assert first.get(image).content == PNG_RED
+
+
 def test_import_seed_pins_cover_assets_before_mapping_changes(tmp_path, monkeypatch):
     seed_db = tmp_path / "seeded.sqlite3"
     seed_dir = tmp_path / "seed"
@@ -489,10 +621,23 @@ def test_seed_upgrade_fills_missing_snapshots_and_preserves_existing_ones(media_
     # Version 2 predates snapshots. Version 3 already has a snapshot of the red cover.
     versions = db_path.parent / f".{db_path.name}.media_pins" / "versions"
     (versions / "2.json").unlink()
+    bindings = db_path.parent / f".{db_path.name}.media_pins.bindings"
+    (bindings / "2.sha256").unlink()
+    # The old layout stored only positive pages and had no independent binding.
+    (bindings / "3.sha256").unlink()
+    legacy = json.loads((versions / "3.json").read_bytes())
+    legacy["pages"] = {key: entry for key, entry in legacy["pages"].items() if entry is not None}
+    (versions / "3.json").write_text(json.dumps(legacy), encoding="utf-8")
     existing = (versions / "3.json").read_bytes()
     with closing(sqlite3.connect(db_path)) as db, db:
         db.execute("UPDATE story_pages SET image_ref = ? WHERE version_id = 3 AND page_no = 1", (cover.name,))
     cover.write_bytes(PNG_BLUE)
+    # Upgrade must wait for the original manifest when it already has a durable binding.
+    pinned = (versions / "4.json").rename(tmp_path / "offline-4.json")
+    with pytest.raises(story_media.MediaDependencyError):
+        import_seed(db_path)
+    assert not (versions / "4.json").exists()
+    pinned.rename(versions / "4.json")
     assert import_seed(db_path) is False
     assert (versions / "3.json").read_bytes() == existing
     cover.unlink()
@@ -503,24 +648,26 @@ def test_seed_upgrade_fills_missing_snapshots_and_preserves_existing_ones(media_
         db.execute("UPDATE story_versions SET status = 'PUBLISHED', reviewed_by_id = 1, reviewed_at = 1 WHERE id IN (2, 3)")
     assert first.get("/api/v1/media/asset-2-cover").content == PNG_BLUE
     assert first.get("/api/v1/media/asset-3-cover").content == PNG_RED
+    assert first.get("/api/v1/story-versions/3").json()["data"]["pages"][0]["imageRef"] is None
+    assert first.get("/api/v1/media/asset-3-page-1").status_code == 404
 
 
-@pytest.mark.parametrize("unwritable", ["versions", "blobs"])
+@pytest.mark.parametrize("unwritable", ["versions", "blobs", ".media.sqlite3.media_pins.bindings"])
 def test_snapshot_write_failure_returns_503_and_reads_recover(media_env, monkeypatch, unwritable):
     first, _, db_path, tmp_path = media_env
     _library_book(db_path, 40, 40, 1, ["page.png"], seed_cover=False)
     (tmp_path / "page.png").write_bytes(PNG_RED)
     monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(tmp_path))
     urls = ("/api/v1/storybooks", "/api/v1/story-versions/40", "/api/v1/media/asset-40-page-1")
-    replace = story_media.os.replace
+    link = story_media.os.link
 
     def refuse_write(src, dst):
         if Path(dst).parent.name == unwritable:
             raise PermissionError("test snapshot store is read-only")
-        return replace(src, dst)
+        return link(src, dst)
 
     with monkeypatch.context() as offline:
-        offline.setattr(story_media.os, "replace", refuse_write)
+        offline.setattr(story_media.os, "link", refuse_write)
         for url in urls:
             response = first.get(url)
             assert response.status_code == 503, url

@@ -6,13 +6,13 @@ from contextlib import closing
 from pathlib import Path
 from time import time_ns
 
-from init_db import ROOT, SEED_TABLES, check_foreign_keys, connect, database_path
+from init_db import ROOT, SEED_TABLES, check_foreign_keys, clear_pin_store, connect, database_path
 
 BACKEND_ROOT = ROOT.parent / "backend"
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.services.story_media import clear_pin_store, pin_database_versions  # noqa: E402
+from app.services.story_media import pin_database_versions  # noqa: E402
 
 SEED_DIR = ROOT.parent / "data" / "seed"
 IDENTITIES = {

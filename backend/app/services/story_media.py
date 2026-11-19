@@ -4,9 +4,9 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import sqlite3
 import threading
+from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 
@@ -37,6 +37,7 @@ DEFAULT_DB_PATH = REPO_ROOT / "database" / "instance" / "zhiya.sqlite3"
 _PIN_LOCK = threading.RLock()
 _DIGEST_LOCK = threading.Lock()
 _VERIFIED_DIGESTS: dict[str, str] = {}
+_VERIFIED_FILES: dict[tuple[str, str], tuple[int, ...]] = {}
 
 
 class MediaDependencyError(RuntimeError):
@@ -144,12 +145,6 @@ def _pin_store_root(db_path: Path | None = None) -> Path:
     return resolved.parent / f".{resolved.name}.media_pins"
 
 
-def clear_pin_store(db_path: Path | None = None) -> None:
-    root = _pin_store_root(db_path)
-    with _PIN_LOCK:
-        shutil.rmtree(root, ignore_errors=True)
-
-
 def _resolve_verified_source(raw_ref: str | None, root: Path) -> tuple[Path, str, str, bytes] | None:
     if not raw_ref or not isinstance(raw_ref, str):
         return None
@@ -198,11 +193,15 @@ def _verified_media_type(data: bytes, digest: str) -> str | None:
 
 
 def _write_snapshot_file(path: Path, data: bytes) -> None:
+    """Publish complete immutable files; concurrent first readers keep the same winner."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".tmp-{path.name}-{os.getpid()}-{threading.get_ident()}")
     try:
         tmp.write_bytes(data)
-        os.replace(tmp, path)
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            pass
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -215,22 +214,30 @@ def _write_blob_once(store_root: Path, digest: str, media_type: str, data: bytes
     return blob_name
 
 
-def _read_pinned_blob(blob_name: str) -> tuple[bytes, str] | None:
+@contextmanager
+def _open_pinned_blob(blob_name: str):
     if not isinstance(blob_name, str) or not BLOB_NAME_RE.fullmatch(blob_name):
-        return None
+        yield None
+        return
     try:
         blobs_dir = (_pin_store_root() / "blobs").resolve()
         candidate = (blobs_dir / blob_name).resolve()
         if not candidate.is_relative_to(blobs_dir):
-            return None
-        data = candidate.read_bytes()
-    except (FileNotFoundError, IsADirectoryError):
-        return None
+            yield None
+            return
+        with candidate.open("rb") as stream:
+            yield stream
     except OSError as exc:
         raise MediaDependencyError("Pinned media storage is unavailable") from exc
+
+
+def _read_pinned_blob(stream, blob_name: str) -> tuple[bytes, str] | None:
+    data = stream.read()
     digest = hashlib.sha256(data).hexdigest()
     if digest != blob_name.partition(".")[0]:
-        return None
+        with _DIGEST_LOCK:
+            _VERIFIED_FILES.pop((stream.name, blob_name), None)
+        raise MediaDependencyError("Pinned media does not match its digest")
     media_type = _verified_media_type(data, digest)
     if media_type is None:
         return None
@@ -246,59 +253,42 @@ def _identity_for_row(version_row: sqlite3.Row | dict, source_type: str) -> dict
     }
 
 
-def _load_version_manifest(store_root: Path, version_id: int, expected_identity: dict) -> dict | None:
-    versions_dir = store_root / "versions"
-    meta_path = versions_dir / f"{version_id}.json"
+def _load_version_manifest(meta_path: Path, binding_path: Path, expected_identity: dict) -> dict | None:
     try:
-        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        binding = binding_path.read_bytes()
     except FileNotFoundError:
+        binding = None
+    try:
+        raw = meta_path.read_bytes()
+    except FileNotFoundError as exc:
+        if binding is not None:
+            raise MediaDependencyError("Bound version media snapshot is unavailable") from exc
         return None
+    digest = hashlib.sha256(raw).hexdigest().encode("ascii")
+    if binding is not None and binding != digest:
+        raise MediaDependencyError("Version media snapshot does not match its binding")
+    try:
+        data = json.loads(raw)
     except ValueError as exc:
         raise MediaDependencyError("Invalid version media snapshot") from exc
-    if (not isinstance(data, dict) or "identity" not in data or "cover" not in data
+    if (not isinstance(data, dict) or data.get("identity") != expected_identity or "cover" not in data
             or not isinstance(data.get("pages"), dict)):
         raise MediaDependencyError("Invalid version media snapshot")
-    if data["identity"] != expected_identity:
-        return None
+    if binding is None:
+        # Adopt complete manifests from the previous layout without consulting mutable source files.
+        _write_snapshot_file(binding_path, digest)
+        if binding_path.read_bytes() != digest:
+            raise MediaDependencyError("Version media snapshot does not match its binding")
     return data
 
 
-def _save_version_manifest(store_root: Path, version_id: int, manifest: dict) -> None:
-    path = store_root / "versions" / f"{version_id}.json"
-    _write_snapshot_file(path, json.dumps(manifest, ensure_ascii=False).encode("utf-8"))
-
-
-def _pin_cover_into_manifest(store_root: Path, manifest: dict, root: Path, entries: list[dict],
-                             storybook_id: int, version_id: int, version_no: int,
-                             source_type: str, source_ref: str | None) -> bool:
-    if source_type != "LIBRARY" or source_ref != SEED_COVER_SOURCE_REF:
-        if manifest.get("cover") is not None:
-            manifest["cover"] = None
-            return True
-        return False
-    cover_path = _select_cover_path(entries, storybook_id, version_id, version_no)
-    resolved = _resolve_verified_source(cover_path, root)
-    if resolved is None:
-        return False
-    _, digest, media_type, data = resolved
-    blob_name = _write_blob_once(store_root, digest, media_type, data)
-    manifest["cover"] = {"blob": blob_name, "mediaType": media_type}
-    return True
-
-
-def _pin_page_into_manifest(store_root: Path, manifest: dict, root: Path, page_no: int, raw_ref: str | None) -> bool:
-    key = str(page_no)
-    existing = manifest["pages"].get(key)
-    if isinstance(existing, dict) and existing.get("rawRef") == raw_ref:
-        return False
+def _pin_asset(store_root: Path, root: Path, raw_ref: str | None) -> dict | None:
     resolved = _resolve_verified_source(raw_ref, root)
     if resolved is None:
-        manifest["pages"].pop(key, None)
-        return existing is not None
+        return None
     _, digest, media_type, data = resolved
     blob_name = _write_blob_once(store_root, digest, media_type, data)
-    manifest["pages"][key] = {"rawRef": raw_ref, "blob": blob_name, "mediaType": media_type}
-    return True
+    return {"blob": blob_name, "mediaType": media_type}
 
 
 def pin_version_media(db: sqlite3.Connection, version_row: sqlite3.Row | dict, *,
@@ -316,28 +306,38 @@ def pin_version_media(db: sqlite3.Connection, version_row: sqlite3.Row | dict, *
             src_type = version_row["storybook_source_type"]
         else:
             src_type = cur.execute("SELECT source_type FROM storybooks WHERE id = ?", (storybook_id,)).fetchone()[0]
-    if pages is None:
-        pages = cur.execute("SELECT page_no, image_ref FROM story_pages WHERE version_id = ? ORDER BY page_no",
-                            (version_id,)).fetchall()
     identity = _identity_for_row(version_row, src_type)
     try:
         store_root = _pin_store_root(db_path)
+        meta_path = store_root / "versions" / f"{version_id}.json"
+        binding_path = store_root.with_name(store_root.name + ".bindings") / f"{version_id}.sha256"
         with _PIN_LOCK:
-            manifest = _load_version_manifest(store_root, version_id, identity)
-            if only_if_missing and manifest is not None:
+            manifest = _load_version_manifest(meta_path, binding_path, identity)
+            if manifest is not None:
+                if not only_if_missing:
+                    ensure_media_dependencies()
                 return manifest
+            if not only_if_missing and cur.execute(
+                "SELECT 1 FROM reading_sessions WHERE version_id = ? LIMIT 1", (version_id,)
+            ).fetchone():
+                raise MediaDependencyError("Reading session requires its original media snapshot")
             root, entries = ensure_media_dependencies()
-            changed = False
+            if pages is None:
+                pages = cur.execute("SELECT page_no, image_ref FROM story_pages WHERE version_id = ? ORDER BY page_no",
+                                    (version_id,)).fetchall()
+            cover_path = None
+            if src_type == "LIBRARY" and version_row["source_ref"] == SEED_COVER_SOURCE_REF:
+                cover_path = _select_cover_path(entries, storybook_id, version_id, version_no)
+            manifest = {"identity": identity, "cover": _pin_asset(store_root, root, cover_path), "pages": {}}
+            for page in pages:
+                asset = _pin_asset(store_root, root, page["image_ref"])
+                if asset is not None:
+                    asset["rawRef"] = page["image_ref"]
+                manifest["pages"][str(page["page_no"])] = asset
+            _write_snapshot_file(meta_path, json.dumps(manifest, ensure_ascii=False).encode("utf-8"))
+            manifest = _load_version_manifest(meta_path, binding_path, identity)
             if manifest is None:
-                manifest = {"identity": identity, "cover": None, "pages": {}}
-                _pin_cover_into_manifest(store_root, manifest, root, entries, storybook_id, version_id,
-                                         version_no, src_type, version_row["source_ref"])
-                changed = True
-            for p in pages:
-                if _pin_page_into_manifest(store_root, manifest, root, int(p["page_no"]), p["image_ref"]):
-                    changed = True
-            if changed:
-                _save_version_manifest(store_root, version_id, manifest)
+                raise MediaDependencyError("New version media snapshot is unavailable")
             return manifest
     except OSError as exc:
         raise MediaDependencyError("Version media snapshot storage is unavailable") from exc
@@ -355,8 +355,32 @@ def pin_database_versions(db: sqlite3.Connection, *, db_path: Path) -> None:
         pin_version_media(db, row, source_type=row["storybook_source_type"], db_path=db_path, only_if_missing=True)
 
 
+def _file_state(stream) -> tuple[int, ...]:
+    stat = os.fstat(stream.fileno())
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
 def _pinned_blob_is_readable(entry: object) -> bool:
-    return isinstance(entry, dict) and _read_pinned_blob(entry.get("blob")) is not None
+    if not isinstance(entry, dict):
+        return False
+    blob_name = entry.get("blob")
+    with _open_pinned_blob(blob_name) as stream:
+        if stream is None:
+            return False
+        state = _file_state(stream)
+        key = (stream.name, blob_name)
+        with _DIGEST_LOCK:
+            if _VERIFIED_FILES.get(key) == state and blob_name.partition(".")[0] in _VERIFIED_DIGESTS:
+                return True
+        if _read_pinned_blob(stream, blob_name) is None:
+            return False
+        if _file_state(stream) != state:
+            raise MediaDependencyError("Pinned media changed during validation")
+        with _DIGEST_LOCK:
+            if len(_VERIFIED_FILES) >= 512:
+                _VERIFIED_FILES.clear()
+            _VERIFIED_FILES[key] = state
+        return True
 
 
 def cover_ref_from_manifest(version_id: int, manifest: dict) -> str | None:
@@ -392,7 +416,9 @@ def read_pinned_asset_bytes(db: sqlite3.Connection, version_row: sqlite3.Row | d
         entry = manifest.get("pages", {}).get(str(page_no))
     if not isinstance(entry, dict):
         return None
-    return _read_pinned_blob(entry.get("blob", ""))
+    blob_name = entry.get("blob")
+    with _open_pinned_blob(blob_name) as stream:
+        return _read_pinned_blob(stream, blob_name) if stream is not None else None
 
 
 def resolve_cover_asset(storybook_id: int, version_no: int, source_type: str,
