@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from app.api.v1.auth import _login_attempts
 from app.main import app
+from app.schemas.agent import ModelGenerateResult
 
 SCHEMA = Path(__file__).resolve().parents[2] / "database" / "schema.sql"
 
@@ -43,6 +44,121 @@ def cont_env(tmp_path, monkeypatch):
                          json={"ageBand": "AGE_4_5", "preferredMinutes": 15}).json()["data"]["childProfileId"]
         yield first, second, db_path, pid
     _login_attempts.clear()
+
+
+@pytest.mark.parametrize("advance_source", [False, True], ids=["switch", "stale-source"])
+def test_generation_approval_and_continuation_switch(cont_env, monkeypatch, tmp_path, advance_source):
+    from PIL import Image
+
+    client, other, db_path, profile = cont_env
+    headers = {"X-CSRF-Token": client.cookies["zhiya_csrf"]}
+    model_contexts = []
+
+    class StoryModel:
+        async def generate(self, request):
+            model_contexts.append(json.loads(request.context_text))
+            return ModelGenerateResult(success=True, text=json.dumps({
+                "title": "森林里的朋友", "pages": ["朋友找到了树叶。", "他们带着树叶回家。"],
+            }))
+
+    monkeypatch.setattr(client.app.state, "model_adapter", StoryModel())
+    monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(tmp_path))
+    cover = tmp_path / "first.png"
+    Image.new("RGB", (2, 2), "green").save(cover)
+    original_image = cover.read_bytes()
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE story_pages SET image_ref = 'first.png' WHERE version_id = 301 AND page_no = 1")
+    created = client.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile, "storyVersionId": 301, "mode": "PARENT_CHILD",
+    })
+    assert created.status_code == 201, created.text
+    session = created.json()["data"]["readingSessionId"]
+    path = f"/api/v1/reading-sessions/{session}"
+    for page, event in ((1, "STARTED"), (2, "PAGE_CHANGED")):
+        assert client.post(f"{path}/events", headers=headers, json={
+            "eventType": event, "pageNumber": page, "expectedRevision": page - 1, "clientEventId": f"read-{page}",
+        }).status_code == 201
+
+    payload = {"sourceReadingSessionId": session, "expectedRevision": 2, "topic": "互助",
+               "characters": ["小兔子"], "scene": "森林", "branching": False, "clientRequestId": "generate-1"}
+    assert other.post("/api/v1/story-generations", headers={"X-CSRF-Token": other.cookies["zhiya_csrf"]},
+                      json=payload).status_code == 404
+    generated = client.post("/api/v1/story-generations", headers=headers, json=payload)
+    assert generated.status_code == 201, generated.text
+    data = generated.json()["data"]
+    version = data["storyVersionId"]
+    assert data["status"] == "PENDING_REVIEW"
+    assert data["continuation"]["resumePageNumber"] == 3
+    assert data["continuation"]["sourceVisitedPageNumbers"] == [1, 2]
+    assert data["pages"][0]["imageRef"] == "asset-301-page-1"
+    assert model_contexts[0]["previousPages"] == ["v1第1页", "v1第2页"]
+    assert model_contexts[0]["ageBand"] == "AGE_4_5"
+    replay = client.post("/api/v1/story-generations", headers=headers, json=payload)
+    assert replay.status_code == 200 and replay.json()["data"] == data
+    mismatch = client.post("/api/v1/story-generations", headers=headers, json={**payload, "scene": "海边"})
+    assert mismatch.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert len(model_contexts) == 1
+    assert client.get(path).json()["data"]["session"]["revision"] == 2
+
+    Image.new("RGB", (2, 2), "red").save(cover)
+    approved = client.post(f"/api/v1/story-versions/{version}/approvals", headers=headers,
+                           json={"versionNumber": data["versionNumber"], "reviewedAllBranches": True})
+    assert approved.status_code == 200, approved.text
+    assert client.get(f"/api/v1/media/asset-{version}-page-1").content == original_image
+    if advance_source:
+        assert client.post(f"{path}/events", headers=headers, json={
+            "eventType": "PAGE_CHANGED", "pageNumber": 3, "expectedRevision": 2, "clientEventId": "read-3",
+        }).status_code == 201
+    switched = client.post("/api/v1/reading-sessions", headers=headers, json={
+        "childProfileId": profile, "storyVersionId": version, "mode": "PARENT_CHILD",
+        "sourceReadingSessionId": session, "expectedRevision": 2, "clientRequestId": "switch-1",
+    })
+    if advance_source:
+        assert switched.status_code == 409
+        assert switched.json()["error"]["code"] == "CONTINUATION_STALE"
+        assert client.post(f"{path}/events", headers=headers, json={
+            "eventType": "PAGE_CHANGED", "pageNumber": 4, "expectedRevision": 3, "clientEventId": "read-4",
+        }).status_code == 201
+    else:
+        assert switched.status_code == 201, switched.text
+        assert switched.json()["data"]["currentPage"] == 3
+        assert client.get(path).json()["data"]["session"]["status"] == "FINISHED"
+
+
+def test_original_generation_checks_and_persists_only_valid_drafts(cont_env, monkeypatch):
+    client, _, db_path, _ = cont_env
+    headers = {"X-CSRF-Token": client.cookies["zhiya_csrf"]}
+    payload = {"ageBand": "AGE_4_5", "topic": "互助", "characters": ["小兔子"], "scene": "森林",
+               "branching": True, "clientRequestId": "invalid-story"}
+    texts = ["兔子到森林散步。", "兔子来到岔路口。", "兔子到树旁绕了一圈。",
+             "兔子和朋友汇合。", "兔子和朋友一起回家。"]
+    contexts = []
+
+    class StoryModel:
+        async def generate(self, request):
+            contexts.append(json.loads(request.context_text))
+            return ModelGenerateResult(success=True, text=json.dumps({
+                "title": "森林里的朋友", "pages": texts if len(contexts) > 1 else [*texts[:-1], "询问家庭地址"],
+                "choices": ["去树旁看看", "去找朋友"],
+            }))
+
+    monkeypatch.setattr(client.app.state, "model_adapter", StoryModel())
+    for _ in range(2):
+        rejected = client.post("/api/v1/story-generations", headers=headers, json=payload)
+        assert rejected.status_code == 422
+    assert len(contexts) == 1
+    with closing(sqlite3.connect(db_path)) as db:
+        assert db.execute("SELECT COUNT(*) FROM storybooks").fetchone() == (1,)
+        assert db.execute("SELECT COUNT(*) FROM story_versions").fetchone() == (1,)
+    accepted = client.post("/api/v1/story-generations", headers=headers,
+                           json={**payload, "clientRequestId": "valid-story"})
+    assert accepted.status_code == 201, accepted.text
+    data = accepted.json()["data"]
+    assert [page["text"] for page in data["pages"]] == texts
+    assert [(branch["fromPageNumber"], branch["nextPageNumber"]) for branch in data["branches"]] == [(2, 3), (2, 4)]
+    approved = client.post(f"/api/v1/story-versions/{data['storyVersionId']}/approvals", headers=headers,
+                           json={"versionNumber": 1, "reviewedAllBranches": True})
+    assert approved.status_code == 200, approved.text
 
 
 def _seed_continuation_draft(db_path: Path, version_id: int, version_no: int, src_session_id: int,
