@@ -43,11 +43,15 @@ docker compose -f infra/compose.yaml run --rm backend python database/import_see
 docker compose -f infra/compose.yaml run --rm backend python database/init_db.py --check
 ```
 
-已有种子库升级时，在更换原素材或封面映射前，用原数据卷再次运行上面的种子导入命令。导入会登记旧清单，只为尚未绑定且缺少清单的版本补建快照。首次固定时缺图的内页在该版本中持续显示占位。
+种子导入时只固定已交付的草稿封面。草稿可以继续补内页图片，重复导入也不会把缺图写成永久占位。升级旧种子库时，请在草稿发布或替换原素材前，用原数据卷再次运行上面的导入命令。升级会识别旧草稿，保留其封面；已经发布的旧版本沿用原清单，包括当时缺图的页。
+
+当前分支尚无 API-028 发布入口。用 SQL 准备联调数据时，请保留审核时的原素材，提交发布状态后立即运行下述补建命令，完成后再换图。跳过补建时，服务会在首次读取该版本时固定内页。此后即使替换同名文件，已绑定的图片与占位也会保持原样。
 
 已有自建绘本库可以单独固定现存版本。先挂载该库原有的图片目录和封面映射，再运行 `docker compose -f infra/compose.yaml run --rm backend python database/import_seed.py --pin-existing-media`。此命令保留业务数据。
 
 备份和恢复 SQLite 文件时，一起保存同目录的 `.<db_name>.media_pins/`（图片和版本清单）与 `.<db_name>.media_pins.bindings/`（各版本的清单摘要）。数据卷需支持同目录硬链接，并允许服务账号读写。已有绑定的清单或图片丢失时，受影响的接口返回可重试的 503。恢复对应快照后，可重试原请求。
+
+API-011 创建阅读会话前会检查已绑定的封面和第一页图片。如果其中一张暂时不可读，接口返回可重试的 503，数据库不会新增会话。封面或首页原本就使用占位时可以正常开读。
 
 受控封面和内页接受 `.png`、`.jpg`、`.jpeg`、`.webp` 路径。API-024 按完整解码得到的格式返回 `Content-Type`。例如，后缀为 `.png` 的有效 JPEG 会以 `image/jpeg` 返回。
 

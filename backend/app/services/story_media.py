@@ -260,6 +260,11 @@ def _identity_for_row(version_row: sqlite3.Row | dict, source_type: str) -> dict
     }
 
 
+def _manifest_paths(store: Path, name: str) -> tuple[Path, Path]:
+    bindings = store.with_name(store.name + ".bindings")
+    return store / "versions" / f"{name}.json", bindings / f"{name}.sha256"
+
+
 def _load_version_manifest(meta_path: Path, binding_path: Path, expected_identity: dict) -> dict | None:
     try:
         binding = binding_path.read_bytes()
@@ -301,7 +306,7 @@ def _pin_asset(store_root: Path, root: Path, raw_ref: str | None) -> dict | None
 def pin_version_media(db: sqlite3.Connection, version_row: sqlite3.Row | dict, *,
                       source_type: str | None = None, pages: list[sqlite3.Row] | None = None,
                       db_path: Path | None = None, backfill: bool = False) -> dict:
-    """Resolve and immutably snapshot verified cover and page assets for one storyVersionId."""
+    """Reserve imported covers while a version is editable; freeze its pages once released."""
     version_id = int(version_row["id"])
     storybook_id = int(version_row["storybook_id"])
     version_no = int(version_row["version_no"])
@@ -314,16 +319,34 @@ def pin_version_media(db: sqlite3.Connection, version_row: sqlite3.Row | dict, *
         else:
             src_type = cur.execute("SELECT source_type FROM storybooks WHERE id = ?", (storybook_id,)).fetchone()[0]
     identity = _identity_for_row(version_row, src_type)
+    draft = version_row["status"] in ("DRAFT", "CHECK_FAILED", "PENDING_REVIEW")
     try:
         store_root = _pin_store_root(db_path)
-        meta_path = store_root / "versions" / f"{version_id}.json"
-        binding_path = store_root.with_name(store_root.name + ".bindings") / f"{version_id}.sha256"
+        original_paths = _manifest_paths(store_root, str(version_id))
+        draft_paths = _manifest_paths(store_root, f"{version_id}.draft")
+        released_paths = _manifest_paths(store_root, f"{version_id}.released")
+        dependencies = None if backfill else ensure_media_dependencies()
         with _PIN_LOCK:
-            manifest = _load_version_manifest(meta_path, binding_path, identity)
-            if manifest is not None:
-                if not backfill:
-                    ensure_media_dependencies()
-                return manifest
+            if not draft:
+                released = _load_version_manifest(*released_paths, identity)
+                if released is not None:
+                    return released
+            staged = _load_version_manifest(*draft_paths, identity)
+            if draft and staged is not None:
+                return staged
+            original = None if staged is not None else _load_version_manifest(*original_paths, identity)
+            if not draft and original is not None:
+                return original
+
+            # On upgrade, an old manifest seen while still DRAFT can supply its cover, never its pages.
+            # An already released legacy version keeps its original manifest byte for byte.
+            previous = original if draft else staged
+            cover = previous.get("cover") if previous is not None else None
+            if draft:
+                meta_path, binding_path = draft_paths
+                pages = []
+            else:
+                meta_path, binding_path = released_paths if staged is not None else original_paths
             if pages is None:
                 pages = cur.execute("SELECT page_no, image_ref FROM story_pages WHERE version_id = ? ORDER BY page_no",
                                     (version_id,)).fetchall()
@@ -332,11 +355,11 @@ def pin_version_media(db: sqlite3.Connection, version_row: sqlite3.Row | dict, *
             if not backfill and (has_seed_cover or any(_image_path_parts(p["image_ref"]) for p in pages)):
                 if cur.execute("SELECT 1 FROM reading_sessions WHERE version_id = ? LIMIT 1", (version_id,)).fetchone():
                     raise MediaDependencyError("Reading session requires its original media snapshot")
-            root, entries = ensure_media_dependencies()
-            cover_path = None
-            if has_seed_cover:
+            root, entries = dependencies or ensure_media_dependencies()
+            if cover is None and has_seed_cover:
                 cover_path = _select_cover_path(entries, storybook_id, version_id, version_no)
-            manifest = {"identity": identity, "cover": _pin_asset(store_root, root, cover_path), "pages": {}}
+                cover = _pin_asset(store_root, root, cover_path)
+            manifest = {"identity": identity, "cover": cover, "pages": {}}
             for page in pages:
                 asset = _pin_asset(store_root, root, page["image_ref"])
                 if asset is not None:
@@ -352,7 +375,7 @@ def pin_version_media(db: sqlite3.Connection, version_row: sqlite3.Row | dict, *
 
 
 def pin_database_versions(db: sqlite3.Connection, *, db_path: Path) -> None:
-    """Pin missing version media during initial seed import and when upgrading an existing database."""
+    """Reserve draft covers and bind released versions to their current page images during import or upgrade."""
     cur = db.cursor()
     cur.row_factory = sqlite3.Row
     versions = cur.execute(
@@ -389,6 +412,13 @@ def _pinned_blob_is_readable(entry: object) -> bool:
                 _VERIFIED_FILES.clear()
             _VERIFIED_FILES[key] = state
         return True
+
+
+def ensure_opening_media(db: sqlite3.Connection, version: sqlite3.Row) -> None:
+    manifest = pin_version_media(db, version)
+    for entry in (manifest["cover"], manifest["pages"].get("1")):
+        if entry is not None and not _pinned_blob_is_readable(entry):
+            raise MediaDependencyError("Pinned opening image is unavailable")
 
 
 def cover_ref_from_manifest(version_id: int, manifest: dict) -> str | None:

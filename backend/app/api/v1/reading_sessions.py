@@ -28,7 +28,7 @@ from app.services.reading_reports import (
     generate_report,
     report_object,
 )
-from app.services.story_media import MediaDependencyError, pin_version_media
+from app.services.story_media import MediaDependencyError, ensure_opening_media
 
 router = APIRouter(prefix="/api/v1/reading-sessions")
 MAX_ID = 9007199254740991
@@ -160,7 +160,7 @@ def create_session(payload: SessionCreate, request: Request):
             ).fetchone()
             if not profile or not version:
                 return error(request, 404, "RESOURCE_NOT_FOUND", "档案或绘本不可用")
-            pin_version_media(db, version, source_type=version["storybook_source_type"])
+            ensure_opening_media(db, version)
             cursor = db.execute(
                 """INSERT INTO reading_sessions
                 (profile_id, version_id, current_page_no, mode, status, created_at)
