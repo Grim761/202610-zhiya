@@ -307,16 +307,17 @@ def _verify_version_for_approval(db, version_row, owner: int) -> str | None:
                 or prefix[0] != 1 or prefix[-1] != version_row["source_page_no"]
                 or version_row["resume_page_no"] != len(prefix) + 1):
             return "续写前缀或继续页码不合法"
-        src_pages = {
-            r[0] for r in db.execute(
-                "SELECT page_no FROM story_pages WHERE version_id = ?", (version_row["source_version_id"],)
-            )
-        }
-        if not all(pno in src_pages for pno in prefix):
-            return "续写源版本页面不存在"
-        for pno in range(1, len(prefix) + 1):
-            if pno not in page_map:
+        source_text = dict(db.execute(
+            "SELECT page_no, body_text FROM story_pages WHERE version_id = ?",
+            (version_row["source_version_id"],),
+        ).fetchall())
+        for carried_page, source_page in enumerate(prefix, start=1):
+            if source_page not in source_text:
+                return "续写源版本页面不存在"
+            if carried_page not in page_map:
                 return "续写前文页码不完整"
+            if page_map[carried_page]["body_text"] != source_text[source_page]:
+                return "续写前文正文与源版本不一致"
         for pno in range(1, len(prefix)):
             if page_map[pno]["default_next_page_number"] != pno + 1:
                 return "续写前文阅读路径不连续"

@@ -69,6 +69,13 @@ def _seed_continuation_draft(db_path: Path, version_id: int, version_no: int, sr
                        (version_id, f"v{version_no}第6页"))
             db.execute("INSERT INTO story_branches VALUES (901, ?, 3, 4, '去森林', 'PENDING')", (version_id,))
             db.execute("INSERT INTO story_branches VALUES (902, ?, 3, 6, '回家去', 'PENDING')", (version_id,))
+        for carried_page, source_page in enumerate(prefix, start=1):
+            db.execute(
+                """UPDATE story_pages SET body_text = (
+                       SELECT body_text FROM story_pages WHERE version_id = 301 AND page_no = ?
+                   ) WHERE version_id = ? AND page_no = ?""",
+                (source_page, version_id, carried_page),
+            )
 
 
 def test_approve_story_version_retires_prior_verifies_dag_and_rejects_invalid(cont_env):
@@ -316,8 +323,22 @@ def test_continuation_switch_from_branched_source_renumbers_carried_prefix(cont_
     }).status_code == 201
     # Source visited [1, 3]; continuation maps carried prefix to 1..2 and resumes at page 3.
     _seed_continuation_draft(db_path, 306, 2, sid1, 2, 3, [1, 3], branching=0)
-    assert first.post("/api/v1/story-versions/306/approvals", headers=h1,
-                      json={"versionNumber": 2, "reviewedAllBranches": True}).status_code == 200
+    approval_path = "/api/v1/story-versions/306/approvals"
+    approval_body = {"versionNumber": 2, "reviewedAllBranches": True}
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE story_pages SET body_text = 'v1第2页' WHERE version_id = 306 AND page_no = 2")
+
+    rejected = first.post(approval_path, headers=h1, json=approval_body)
+    assert rejected.status_code == 422
+    assert rejected.json()["error"]["code"] == "VALIDATION_ERROR"
+    with closing(sqlite3.connect(db_path)) as db, db:
+        assert db.execute("SELECT status FROM story_versions WHERE id = 301").fetchone() == ("APPROVED_PRIVATE",)
+        assert db.execute("SELECT status FROM story_versions WHERE id = 306").fetchone() == ("PENDING_REVIEW",)
+        db.execute("UPDATE story_pages SET body_text = 'v1第3页' WHERE version_id = 306 AND page_no = 2")
+
+    approved = first.post(approval_path, headers=h1, json=approval_body)
+    assert approved.status_code == 200
+    assert [p["text"] for p in approved.json()["data"]["pages"][:2]] == ["v1第1页", "v1第3页"]
     switched = first.post("/api/v1/reading-sessions", headers=h1, json={
         "childProfileId": pid, "storyVersionId": 306, "mode": "PARENT_CHILD",
         "sourceReadingSessionId": sid1, "expectedRevision": 2, "clientRequestId": "switch-branched",
