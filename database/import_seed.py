@@ -81,6 +81,7 @@ def import_seed(path: Path, seed_dir: Path = SEED_DIR) -> bool:
                             f"{table}: database is populated but some seed identities are missing"
                         )
             check_foreign_keys(db)
+            pin_database_versions(db, db_path=path)
             return False
 
         for table, fields in FIELDS.items():

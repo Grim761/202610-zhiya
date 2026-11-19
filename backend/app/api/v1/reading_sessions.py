@@ -160,11 +160,7 @@ def create_session(payload: SessionCreate, request: Request):
             ).fetchone()
             if not profile or not version:
                 return error(request, 404, "RESOURCE_NOT_FOUND", "档案或绘本不可用")
-            try:
-                # Snapshot the version's cover and page images when a session binds to it.
-                pin_version_media(db, version, source_type=version["storybook_source_type"])
-            except MediaDependencyError:
-                pass
+            pin_version_media(db, version, source_type=version["storybook_source_type"])
             cursor = db.execute(
                 """INSERT INTO reading_sessions
                 (profile_id, version_id, current_page_no, mode, status, created_at)
@@ -174,6 +170,8 @@ def create_session(payload: SessionCreate, request: Request):
             row = db.execute("SELECT *, NULL AS grant_expires_at FROM reading_sessions WHERE id = ?",
                              (cursor.lastrowid,)).fetchone()
             return {"data": session_object(row), "requestId": request.state.request_id}
+    except MediaDependencyError:
+        return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
     except sqlite3.Error:
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用")
 

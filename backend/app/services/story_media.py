@@ -6,10 +6,11 @@ import os
 import re
 import shutil
 import sqlite3
-import struct
 import threading
-import zlib
+from io import BytesIO
 from pathlib import Path, PurePosixPath
+
+from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MEDIA_DIR_PREFIX = ("knowledge-base_v2.5", "图片")
@@ -27,31 +28,10 @@ MEDIA_TYPE_EXTENSIONS = {
     "image/jpeg": ".jpg",
     "image/webp": ".webp",
 }
-PNG_BIT_DEPTHS = {
-    0: frozenset({1, 2, 4, 8, 16}),
-    2: frozenset({8, 16}),
-    3: frozenset({1, 2, 4, 8}),
-    4: frozenset({8, 16}),
-    6: frozenset({8, 16}),
-}
-PNG_SAMPLES = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
-ADAM7_PASSES = (
-    (0, 0, 8, 8),
-    (4, 0, 8, 8),
-    (0, 4, 4, 8),
-    (2, 0, 4, 4),
-    (0, 2, 2, 4),
-    (1, 0, 2, 2),
-    (0, 1, 1, 2),
-)
-JPEG_SOF_MARKERS = frozenset({
-    0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
-    0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
-})
+IMAGE_FORMATS = ("PNG", "JPEG", "WEBP")
 ASSET_KEY_RE = re.compile(r"^asset-([1-9][0-9]{0,15})-(cover|page-([1-9][0-9]{0,15}))$")
 BLOB_NAME_RE = re.compile(r"^[0-9a-f]{64}\.(png|jpg|webp)$")
 MAX_ID = 9007199254740991
-SNIFF_BYTES = 12
 DEFAULT_DB_PATH = REPO_ROOT / "database" / "instance" / "zhiya.sqlite3"
 
 _PIN_LOCK = threading.RLock()
@@ -60,197 +40,30 @@ _VERIFIED_DIGESTS: dict[str, str] = {}
 
 
 class MediaDependencyError(RuntimeError):
-    """Raised when the configured or default media root or cover mapping cannot be read."""
-
-
-def _expected_png_raw_bytes(width: int, height: int, bit_depth: int, color_type: int, interlace: int) -> int:
-    bpp = PNG_SAMPLES[color_type] * bit_depth
-    if interlace == 0:
-        row_bytes = (width * bpp + 7) // 8
-        return (row_bytes + 1) * height
-    total = 0
-    for x0, y0, dx, dy in ADAM7_PASSES:
-        pw = (width - x0 + dx - 1) // dx if width > x0 else 0
-        ph = (height - y0 + dy - 1) // dy if height > y0 else 0
-        if pw > 0 and ph > 0:
-            total += ((pw * bpp + 7) // 8 + 1) * ph
-    return total
-
-
-def _verify_png(data: bytes) -> bool:
-    if len(data) < 33 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return False
-    pos = 8
-    size = len(data)
-    ihdr: tuple[int, int, int, int, int] | None = None
-    idat = bytearray()
-    seen_plte = False
-    seen_iend = False
-    while pos < size:
-        if pos + 12 > size:
-            return False
-        length, chunk_type = struct.unpack(">I4s", data[pos:pos + 8])
-        end = pos + 12 + length
-        if end > size:
-            return False
-        payload = data[pos + 8:pos + 8 + length]
-        (crc,) = struct.unpack(">I", data[pos + 8 + length:end])
-        if (zlib.crc32(chunk_type + payload) & 0xFFFFFFFF) != crc:
-            return False
-        if chunk_type == b"IHDR":
-            if pos != 8 or length != 13:
-                return False
-            width, height, bit_depth, color_type, comp, filt, interlace = struct.unpack(">IIBBBBB", payload)
-            if (width == 0 or height == 0 or color_type not in PNG_BIT_DEPTHS
-                    or bit_depth not in PNG_BIT_DEPTHS[color_type]
-                    or comp != 0 or filt != 0 or interlace not in (0, 1)):
-                return False
-            ihdr = (width, height, bit_depth, color_type, interlace)
-        else:
-            if ihdr is None or seen_iend:
-                return False
-            if chunk_type == b"PLTE":
-                if length % 3 != 0 or not 3 <= length <= 768:
-                    return False
-                seen_plte = True
-            elif chunk_type == b"IDAT":
-                idat.extend(payload)
-            elif chunk_type == b"IEND":
-                if length != 0:
-                    return False
-                seen_iend = True
-                pos = end
-                break
-        pos = end
-    if ihdr is None or not seen_iend or pos != size or not idat:
-        return False
-    width, height, bit_depth, color_type, interlace = ihdr
-    if color_type == 3 and not seen_plte:
-        return False
-    try:
-        decomp = zlib.decompressobj()
-        raw = decomp.decompress(bytes(idat)) + decomp.flush()
-    except zlib.error:
-        return False
-    if not decomp.eof or decomp.unused_data:
-        return False
-    return len(raw) == _expected_png_raw_bytes(width, height, bit_depth, color_type, interlace)
-
-
-def _verify_jpeg(data: bytes) -> bool:
-    size = len(data)
-    if size < 4 or not data.startswith(b"\xff\xd8"):
-        return False
-    pos = 2
-    seen_sof = False
-    seen_sos = False
-    while pos < size:
-        if data[pos] != 0xFF:
-            return False
-        while pos < size and data[pos] == 0xFF:
-            pos += 1
-        if pos >= size:
-            return False
-        marker = data[pos]
-        pos += 1
-        if marker == 0xD9:
-            return seen_sof and seen_sos and pos == size
-        if marker == 0x00 or 0xD0 <= marker <= 0xD8:
-            return False
-        if marker == 0x01:
-            continue
-        if pos + 2 > size:
-            return False
-        (seg_len,) = struct.unpack(">H", data[pos:pos + 2])
-        if seg_len < 2 or pos + seg_len > size:
-            return False
-        if marker in JPEG_SOF_MARKERS:
-            if seg_len < 8:
-                return False
-            precision, height, width, num_comp = struct.unpack(">BHHB", data[pos + 2:pos + 8])
-            if precision == 0 or height == 0 or width == 0 or num_comp == 0:
-                return False
-            seen_sof = True
-        pos += seg_len
-        if marker == 0xDA:
-            seen_sos = True
-            while True:
-                idx = data.find(0xFF, pos)
-                if idx == -1:
-                    return False
-                scan = idx
-                while scan < size and data[scan] == 0xFF:
-                    scan += 1
-                if scan >= size:
-                    return False
-                next_marker = data[scan]
-                if next_marker == 0x00 or 0xD0 <= next_marker <= 0xD7:
-                    pos = scan + 1
-                    continue
-                pos = scan - 1
-                break
-    return False
-
-
-def _verify_webp(data: bytes) -> bool:
-    size = len(data)
-    if size < 20 or not data.startswith(b"RIFF") or data[8:12] != b"WEBP":
-        return False
-    riff_size = int.from_bytes(data[4:8], "little")
-    end_riff = 8 + riff_size
-    if riff_size < 12 or size != end_riff:
-        return False
-    pos = 12
-    seen_frame = False
-    while pos < end_riff:
-        if pos + 8 > end_riff:
-            return False
-        fourcc = data[pos:pos + 4]
-        chunk_size = int.from_bytes(data[pos + 4:pos + 8], "little")
-        payload_start = pos + 8
-        payload_end = payload_start + chunk_size
-        if payload_end > end_riff:
-            return False
-        payload = data[payload_start:payload_end]
-        if fourcc == b"VP8 ":
-            if chunk_size < 10 or payload[3:6] != b"\x9d\x01\x2a":
-                return False
-            width = int.from_bytes(payload[6:8], "little") & 0x3FFF
-            height = int.from_bytes(payload[8:10], "little") & 0x3FFF
-            if width == 0 or height == 0:
-                return False
-            seen_frame = True
-        elif fourcc == b"VP8L":
-            if chunk_size < 5 or payload[0] != 0x2F:
-                return False
-            bits = int.from_bytes(payload[1:5], "little")
-            width = (bits & 0x3FFF) + 1
-            height = ((bits >> 14) & 0x3FFF) + 1
-            if width == 0 or height == 0:
-                return False
-            seen_frame = True
-        elif fourcc == b"ANMF":
-            if chunk_size < 16:
-                return False
-            seen_frame = True
-        padded_end = payload_end + (chunk_size & 1)
-        if padded_end > end_riff:
-            return False
-        pos = padded_end
-    return seen_frame and pos == end_riff
+    """The media source or the version snapshot store is temporarily unavailable."""
 
 
 def verify_and_detect_image(data: bytes) -> str | None:
-    """Validate that bytes represent a complete decodable PNG, JPEG, or WebP and return its real MIME type."""
-    if len(data) < SNIFF_BYTES:
+    """Return the actual MIME type only after verifying the container and decoding every frame."""
+    try:
+        with Image.open(BytesIO(data), formats=IMAGE_FORMATS) as image:
+            fmt = image.format
+            if fmt == "PNG" and not data.endswith(b"\0\0\0\0IEND\xae\x42\x60\x82"):
+                return None
+            if fmt == "JPEG" and not data.endswith(b"\xff\xd9"):
+                return None
+            if fmt == "WEBP" and int.from_bytes(data[4:8], "little") + 8 != len(data):
+                return None
+            image.verify()
+
+        # Pillow requires reopening the image after verify() to decode its pixels.
+        with Image.open(BytesIO(data), formats=(fmt,)) as image:
+            for frame in range(getattr(image, "n_frames", 1)):
+                image.seek(frame)
+                image.load()
+        return Image.MIME[fmt]
+    except (OSError, SyntaxError, ValueError, EOFError, Image.DecompressionBombError):
         return None
-    if data.startswith(b"\x89PNG\r\n\x1a\n") and _verify_png(data):
-        return "image/png"
-    if data.startswith(b"\xff\xd8") and _verify_jpeg(data):
-        return "image/jpeg"
-    if data.startswith(b"RIFF") and data[8:12] == b"WEBP" and _verify_webp(data):
-        return "image/webp"
-    return None
 
 
 def _media_root() -> Path:
@@ -365,54 +178,60 @@ def _resolve_verified_source(raw_ref: str | None, root: Path) -> tuple[Path, str
         raise MediaDependencyError("Media storage check failed") from exc
 
     digest = hashlib.sha256(data).hexdigest()
+    media_type = _verified_media_type(data, digest)
+    if media_type is None:
+        return None
+    return candidate, digest, media_type, data
+
+
+def _verified_media_type(data: bytes, digest: str) -> str | None:
     with _DIGEST_LOCK:
         media_type = _VERIFIED_DIGESTS.get(digest)
     if media_type is None:
         media_type = verify_and_detect_image(data)
-        if media_type is None:
-            return None
-        with _DIGEST_LOCK:
-            if len(_VERIFIED_DIGESTS) > 512:
-                _VERIFIED_DIGESTS.clear()
-            _VERIFIED_DIGESTS[digest] = media_type
-    return candidate, digest, media_type, data
+        if media_type is not None:
+            with _DIGEST_LOCK:
+                if len(_VERIFIED_DIGESTS) > 512:
+                    _VERIFIED_DIGESTS.clear()
+                _VERIFIED_DIGESTS[digest] = media_type
+    return media_type
+
+
+def _write_snapshot_file(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".tmp-{path.name}-{os.getpid()}-{threading.get_ident()}")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _write_blob_once(store_root: Path, digest: str, media_type: str, data: bytes) -> str:
-    ext = MEDIA_TYPE_EXTENSIONS[media_type]
-    blob_name = f"{digest}{ext}"
-    if not BLOB_NAME_RE.fullmatch(blob_name):
-        raise ValueError("Invalid pinned blob name")
-    blobs_dir = store_root / "blobs"
-    blobs_dir.mkdir(parents=True, exist_ok=True)
-    target = blobs_dir / blob_name
-    if target.is_file():
-        return blob_name
-    tmp = blobs_dir / f".tmp-{blob_name}-{os.getpid()}-{threading.get_ident()}"
-    tmp.write_bytes(data)
-    try:
-        os.replace(tmp, target)
-    except OSError:
-        tmp.unlink(missing_ok=True)
-        if not target.is_file():
-            raise
+    blob_name = digest + MEDIA_TYPE_EXTENSIONS[media_type]
+    target = store_root / "blobs" / blob_name
+    if not target.is_file():
+        _write_snapshot_file(target, data)
     return blob_name
 
 
-def _read_pinned_blob(store_root: Path, blob_name: str) -> tuple[bytes, str] | None:
+def _read_pinned_blob(blob_name: str) -> tuple[bytes, str] | None:
     if not isinstance(blob_name, str) or not BLOB_NAME_RE.fullmatch(blob_name):
         return None
-    blobs_dir = (store_root / "blobs").resolve()
-    candidate = (blobs_dir / blob_name).resolve()
-    if not candidate.is_relative_to(blobs_dir):
-        return None
     try:
-        if not candidate.is_file():
+        blobs_dir = (_pin_store_root() / "blobs").resolve()
+        candidate = (blobs_dir / blob_name).resolve()
+        if not candidate.is_relative_to(blobs_dir):
             return None
         data = candidate.read_bytes()
+    except (FileNotFoundError, IsADirectoryError):
+        return None
     except OSError as exc:
-        raise MediaDependencyError("Pinned media storage check failed") from exc
-    media_type = verify_and_detect_image(data)
+        raise MediaDependencyError("Pinned media storage is unavailable") from exc
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != blob_name.partition(".")[0]:
+        return None
+    media_type = _verified_media_type(data, digest)
     if media_type is None:
         return None
     return data, media_type
@@ -430,26 +249,23 @@ def _identity_for_row(version_row: sqlite3.Row | dict, source_type: str) -> dict
 def _load_version_manifest(store_root: Path, version_id: int, expected_identity: dict) -> dict | None:
     versions_dir = store_root / "versions"
     meta_path = versions_dir / f"{version_id}.json"
-    if not meta_path.is_file():
-        return None
     try:
         data = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return None
-    if not isinstance(data, dict) or data.get("identity") != expected_identity:
-        return None
-    if "cover" not in data or not isinstance(data.get("pages"), dict):
+    except ValueError as exc:
+        raise MediaDependencyError("Invalid version media snapshot") from exc
+    if (not isinstance(data, dict) or "identity" not in data or "cover" not in data
+            or not isinstance(data.get("pages"), dict)):
+        raise MediaDependencyError("Invalid version media snapshot")
+    if data["identity"] != expected_identity:
         return None
     return data
 
 
 def _save_version_manifest(store_root: Path, version_id: int, manifest: dict) -> None:
-    versions_dir = store_root / "versions"
-    versions_dir.mkdir(parents=True, exist_ok=True)
-    meta_path = versions_dir / f"{version_id}.json"
-    tmp = versions_dir / f".tmp-{version_id}-{os.getpid()}-{threading.get_ident()}.json"
-    tmp.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, meta_path)
+    path = store_root / "versions" / f"{version_id}.json"
+    _write_snapshot_file(path, json.dumps(manifest, ensure_ascii=False).encode("utf-8"))
 
 
 def _pin_cover_into_manifest(store_root: Path, manifest: dict, root: Path, entries: list[dict],
@@ -487,9 +303,8 @@ def _pin_page_into_manifest(store_root: Path, manifest: dict, root: Path, page_n
 
 def pin_version_media(db: sqlite3.Connection, version_row: sqlite3.Row | dict, *,
                       source_type: str | None = None, pages: list[sqlite3.Row] | None = None,
-                      db_path: Path | None = None) -> dict:
+                      db_path: Path | None = None, only_if_missing: bool = False) -> dict:
     """Resolve and immutably snapshot verified cover and page assets for one storyVersionId."""
-    root, entries = ensure_media_dependencies()
     version_id = int(version_row["id"])
     storybook_id = int(version_row["storybook_id"])
     version_no = int(version_row["version_no"])
@@ -505,26 +320,31 @@ def pin_version_media(db: sqlite3.Connection, version_row: sqlite3.Row | dict, *
         pages = cur.execute("SELECT page_no, image_ref FROM story_pages WHERE version_id = ? ORDER BY page_no",
                             (version_id,)).fetchall()
     identity = _identity_for_row(version_row, src_type)
-    store_root = _pin_store_root(db_path)
-
-    with _PIN_LOCK:
-        manifest = _load_version_manifest(store_root, version_id, identity)
-        changed = False
-        if manifest is None:
-            manifest = {"identity": identity, "cover": None, "pages": {}}
-            _pin_cover_into_manifest(store_root, manifest, root, entries, storybook_id, version_id,
-                                     version_no, src_type, version_row["source_ref"])
-            changed = True
-        for p in pages:
-            if _pin_page_into_manifest(store_root, manifest, root, int(p["page_no"]), p["image_ref"]):
+    try:
+        store_root = _pin_store_root(db_path)
+        with _PIN_LOCK:
+            manifest = _load_version_manifest(store_root, version_id, identity)
+            if only_if_missing and manifest is not None:
+                return manifest
+            root, entries = ensure_media_dependencies()
+            changed = False
+            if manifest is None:
+                manifest = {"identity": identity, "cover": None, "pages": {}}
+                _pin_cover_into_manifest(store_root, manifest, root, entries, storybook_id, version_id,
+                                         version_no, src_type, version_row["source_ref"])
                 changed = True
-        if changed:
-            _save_version_manifest(store_root, version_id, manifest)
-        return manifest
+            for p in pages:
+                if _pin_page_into_manifest(store_root, manifest, root, int(p["page_no"]), p["image_ref"]):
+                    changed = True
+            if changed:
+                _save_version_manifest(store_root, version_id, manifest)
+            return manifest
+    except OSError as exc:
+        raise MediaDependencyError("Version media snapshot storage is unavailable") from exc
 
 
 def pin_database_versions(db: sqlite3.Connection, *, db_path: Path) -> None:
-    """Pin all story_versions in a freshly populated database during seed import."""
+    """Pin missing version media during initial seed import and when upgrading an existing database."""
     cur = db.cursor()
     cur.row_factory = sqlite3.Row
     versions = cur.execute(
@@ -532,23 +352,20 @@ def pin_database_versions(db: sqlite3.Connection, *, db_path: Path) -> None:
            JOIN storybooks b ON b.id = v.storybook_id ORDER BY v.id"""
     ).fetchall()
     for row in versions:
-        pin_version_media(db, row, source_type=row["storybook_source_type"], db_path=db_path)
+        pin_version_media(db, row, source_type=row["storybook_source_type"], db_path=db_path, only_if_missing=True)
 
 
-def _pinned_blob_exists(entry: object) -> bool:
-    if not isinstance(entry, dict):
-        return False
-    blob_name = entry.get("blob")
-    return isinstance(blob_name, str) and bool(BLOB_NAME_RE.fullmatch(blob_name)) and (_pin_store_root() / "blobs" / blob_name).is_file()
+def _pinned_blob_is_readable(entry: object) -> bool:
+    return isinstance(entry, dict) and _read_pinned_blob(entry.get("blob")) is not None
 
 
 def cover_ref_from_manifest(version_id: int, manifest: dict) -> str | None:
-    return f"asset-{version_id}-cover" if _pinned_blob_exists(manifest.get("cover")) else None
+    return f"asset-{version_id}-cover" if _pinned_blob_is_readable(manifest.get("cover")) else None
 
 
 def page_image_ref_from_manifest(version_id: int, page_no: int, manifest: dict) -> str | None:
     entry = manifest.get("pages", {}).get(str(page_no))
-    return f"asset-{version_id}-page-{page_no}" if _pinned_blob_exists(entry) else None
+    return f"asset-{version_id}-page-{page_no}" if _pinned_blob_is_readable(entry) else None
 
 
 def page_image_ref_for(db: sqlite3.Connection, version_id: int, page_no: int) -> str | None:
@@ -569,14 +386,13 @@ def read_pinned_asset_bytes(db: sqlite3.Connection, version_row: sqlite3.Row | d
                             page_no: int | None) -> tuple[bytes, str] | None:
     """Validate media dependencies and serve verified immutable bytes pinned for this storyVersionId."""
     manifest = pin_version_media(db, version_row)
-    store_root = _pin_store_root()
     if page_no is None:
         entry = manifest.get("cover")
     else:
         entry = manifest.get("pages", {}).get(str(page_no))
     if not isinstance(entry, dict):
         return None
-    return _read_pinned_blob(store_root, entry.get("blob", ""))
+    return _read_pinned_blob(entry.get("blob", ""))
 
 
 def resolve_cover_asset(storybook_id: int, version_no: int, source_type: str,

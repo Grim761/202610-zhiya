@@ -8,10 +8,12 @@ import struct
 import sys
 import zlib
 from contextlib import closing
+from io import BytesIO
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image, WebPImagePlugin
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "database"))
@@ -404,6 +406,16 @@ def test_cover_is_pinned_to_story_version_on_filename_reuse_and_mapping_replacem
     headers = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}
     profile = first.post("/api/v1/child-profiles", headers=headers,
                          json={"ageBand": "AGE_3_4", "preferredMinutes": 10}).json()["data"]["childProfileId"]
+    with monkeypatch.context() as missing_media:
+        missing_media.setenv("ZHIYA_MEDIA_ROOT", str(tmp_path / "offline"))
+        failed = first.post("/api/v1/reading-sessions", headers=headers, json={
+            "childProfileId": profile, "storyVersionId": 20, "mode": "PARENT_CHILD",
+        })
+        assert failed.status_code == 503
+        assert failed.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+        assert failed.json()["error"]["retryable"] is True
+    with closing(sqlite3.connect(db_path)) as db:
+        assert db.execute("SELECT count(*) FROM reading_sessions WHERE version_id = 20").fetchone() == (0,)
     # Bind active sessions to both v20 and v30 (note v30 is bound via POST /reading-sessions without fetching media first).
     assert first.post("/api/v1/reading-sessions", headers=headers, json={
         "childProfileId": profile, "storyVersionId": 20, "mode": "PARENT_CHILD",
@@ -462,6 +474,64 @@ def test_import_seed_pins_cover_assets_before_mapping_changes(tmp_path, monkeypa
     _login_attempts.clear()
 
 
+def test_seed_upgrade_fills_missing_snapshots_and_preserves_existing_ones(media_env, monkeypatch):
+    first, _, db_path, tmp_path = media_env
+    cover = tmp_path / "cover.png"
+    cover.write_bytes(PNG_RED)
+    mapping = tmp_path / "covers.json"
+    mapping.write_text(json.dumps([
+        {"storybook_id": book_id, "cover_path": cover.name} for book_id in (2, 3)
+    ]), encoding="utf-8")
+    monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(tmp_path))
+    monkeypatch.setenv("ZHIYA_COVER_MAPPING_PATH", str(mapping))
+    assert import_seed(db_path) is True
+
+    # Version 2 predates snapshots. Version 3 already has a snapshot of the red cover.
+    versions = db_path.parent / f".{db_path.name}.media_pins" / "versions"
+    (versions / "2.json").unlink()
+    existing = (versions / "3.json").read_bytes()
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE story_pages SET image_ref = ? WHERE version_id = 3 AND page_no = 1", (cover.name,))
+    cover.write_bytes(PNG_BLUE)
+    assert import_seed(db_path) is False
+    assert (versions / "3.json").read_bytes() == existing
+    cover.unlink()
+    with monkeypatch.context() as offline:
+        offline.setenv("ZHIYA_MEDIA_ROOT", str(tmp_path / "offline"))
+        assert import_seed(db_path) is False
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE story_versions SET status = 'PUBLISHED', reviewed_by_id = 1, reviewed_at = 1 WHERE id IN (2, 3)")
+    assert first.get("/api/v1/media/asset-2-cover").content == PNG_BLUE
+    assert first.get("/api/v1/media/asset-3-cover").content == PNG_RED
+
+
+@pytest.mark.parametrize("unwritable", ["versions", "blobs"])
+def test_snapshot_write_failure_returns_503_and_reads_recover(media_env, monkeypatch, unwritable):
+    first, _, db_path, tmp_path = media_env
+    _library_book(db_path, 40, 40, 1, ["page.png"], seed_cover=False)
+    (tmp_path / "page.png").write_bytes(PNG_RED)
+    monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(tmp_path))
+    urls = ("/api/v1/storybooks", "/api/v1/story-versions/40", "/api/v1/media/asset-40-page-1")
+    replace = story_media.os.replace
+
+    def refuse_write(src, dst):
+        if Path(dst).parent.name == unwritable:
+            raise PermissionError("test snapshot store is read-only")
+        return replace(src, dst)
+
+    with monkeypatch.context() as offline:
+        offline.setattr(story_media.os, "replace", refuse_write)
+        for url in urls:
+            response = first.get(url)
+            assert response.status_code == 503, url
+            assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+            assert response.json()["error"]["retryable"] is True
+    assert not list((db_path.parent / f".{db_path.name}.media_pins").rglob(".tmp-*"))
+    assert first.get(urls[0]).status_code == 200
+    assert first.get(urls[1]).json()["data"]["pages"][0]["imageRef"] == "asset-40-page-1"
+    assert first.get(urls[2]).content == PNG_RED
+
+
 def test_missing_default_cover_mapping_is_a_retryable_dependency_failure(media_env, monkeypatch):
     first, _, db_path, tmp_path = media_env
     _library_book(db_path, 2, 2, 1, ["none"])
@@ -478,7 +548,35 @@ def test_missing_default_cover_mapping_is_a_retryable_dependency_failure(media_e
     assert first.get("/api/v1/media/asset-40-cover").status_code == 404
 
 
-def test_empty_mismatched_and_truncated_image_files(media_env, monkeypatch):
+def test_unreadable_later_frame_blocks_new_and_preexisting_media_keys(media_env, monkeypatch):
+    first, _, db_path, tmp_path = media_env
+    monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(tmp_path))
+    with BytesIO() as stream, Image.new("RGB", (2, 2), "red") as red, Image.new("RGB", (2, 2), "blue") as blue:
+        red.save(stream, format="WEBP", save_all=True, append_images=[blue], duration=100, lossless=True)
+        animation = stream.getvalue()
+    (tmp_path / "story.webp").write_bytes(animation)
+    _library_book(db_path, 50, 50, 1, ["story.webp"], seed_cover=False)
+    assert first.get("/api/v1/media/asset-50-page-1").content == animation
+
+    # Simulate a fresh process whose decoder cannot read the second frame of a previously pinned image.
+    monkeypatch.setattr(story_media, "_VERIFIED_DIGESTS", {})
+    load_frame = WebPImagePlugin.WebPImageFile.load
+
+    def fail_on_second_frame(image):
+        if image.tell() == 1:
+            raise OSError("second frame could not be decoded")
+        return load_frame(image)
+
+    monkeypatch.setattr(WebPImagePlugin.WebPImageFile, "load", fail_on_second_frame)
+    _library_book(db_path, 51, 51, 1, ["story.webp"], seed_cover=False)
+    for version in (50, 51):
+        detail = first.get(f"/api/v1/story-versions/{version}")
+        assert detail.status_code == 200
+        assert detail.json()["data"]["pages"][0]["imageRef"] is None
+        assert first.get(f"/api/v1/media/asset-{version}-page-1").status_code == 404
+
+
+def test_unreadable_images_are_rejected_and_decodable_files_use_their_actual_type(media_env, monkeypatch):
     first, _, db_path, tmp_path = media_env
     media_root = tmp_path / "media"
     media_root.mkdir()
@@ -492,6 +590,7 @@ def test_empty_mismatched_and_truncated_image_files(media_env, monkeypatch):
     (media_root / "text.png").write_bytes(b"not an image at all")
     (media_root / "photo.png").write_bytes(VALID_JPEG)
     (media_root / "good.webp").write_bytes(VALID_WEBP)
+    (media_root / "photo.txt").write_bytes(VALID_JPEG)
     monkeypatch.setenv("ZHIYA_MEDIA_ROOT", str(media_root))
     _library_book(
         db_path,
@@ -508,6 +607,7 @@ def test_empty_mismatched_and_truncated_image_files(media_env, monkeypatch):
             "text.png",
             "photo.png",
             "good.webp",
+            "photo.txt",
         ],
         seed_cover=False,
     )
@@ -523,11 +623,12 @@ def test_empty_mismatched_and_truncated_image_files(media_env, monkeypatch):
         None,
         "asset-50-page-8",
         "asset-50-page-9",
+        None,
     ]
     real_resp = first.get("/api/v1/media/asset-50-page-1")
     assert real_resp.status_code == 200 and real_resp.headers["content-type"] == "image/png"
     assert real_resp.content == real_png
-    for invalid_page in (2, 3, 4, 5, 6, 7):
+    for invalid_page in (2, 3, 4, 5, 6, 7, 10):
         assert first.get(f"/api/v1/media/asset-50-page-{invalid_page}").status_code == 404
     photo = first.get("/api/v1/media/asset-50-page-8")
     assert photo.status_code == 200 and photo.headers["content-type"] == "image/jpeg" and photo.content == VALID_JPEG

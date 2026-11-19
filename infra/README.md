@@ -43,6 +43,10 @@ docker compose -f infra/compose.yaml run --rm backend python database/import_see
 docker compose -f infra/compose.yaml run --rm backend python database/init_db.py --check
 ```
 
+已有种子库升级时，请在替换旧图片或封面映射前，用原数据卷再次运行上面的种子导入命令。它会用当前素材补建缺失的版本快照，并保留已有快照。快照保存在 SQLite 文件旁，服务账号需要该目录的读写权限。
+
+受控封面和内页接受 `.png`、`.jpg`、`.jpeg`、`.webp` 路径。API-024 按完整解码得到的格式返回 `Content-Type`。例如，后缀为 `.png` 的有效 JPEG 会以 `image/jpeg` 返回。
+
 种子不是生产内容，不自动导入生产数据库。SQLite 文件保存在 Compose 命名卷 `sqlite-data`，容器使用 UID/GID 10001。首次创建卷时由镜像目录继承写权限；外部已有卷需自行核对权限。单 worker 运行，关闭 Uvicorn access log；应用自己的请求元数据日志仍保留。
 
 ```sh
