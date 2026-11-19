@@ -148,6 +148,81 @@ def test_approve_story_version_retires_prior_verifies_dag_and_rejects_invalid(co
     assert [v["storyVersionId"] for v in first.get("/api/v1/storybooks", params={"scope": "mine"}).json()["data"]["items"]] == [302, 301]
 
 
+def test_continuation_metadata_is_omitted_from_granted_child_books(cont_env):
+    guardian, _, db_path, profile_id = cont_env
+    headers = {"X-CSRF-Token": guardian.cookies["zhiya_csrf"]}
+    sessions_url = "/api/v1/reading-sessions"
+    session_body = {"childProfileId": profile_id, "mode": "PARENT_CHILD"}
+    source = guardian.post(sessions_url, headers=headers, json={**session_body, "storyVersionId": 301})
+    assert source.status_code == 201
+    source_id = source.json()["data"]["readingSessionId"]
+    started = guardian.post(f"{sessions_url}/{source_id}/events", headers=headers, json={
+        "eventType": "STARTED", "pageNumber": 1, "expectedRevision": 0, "clientEventId": "start-source",
+    })
+    assert started.status_code == 201
+    _seed_continuation_draft(db_path, 302, 2, source_id, 1, 1, [1], branching=1)
+
+    detail_url = "/api/v1/story-versions/302"
+    shelf_url = "/api/v1/storybooks"
+    approved = guardian.post(f"{detail_url}/approvals", headers=headers, json={
+        "versionNumber": 2, "reviewedAllBranches": True,
+    })
+    shelf = guardian.get(shelf_url, params={"scope": "mine"})
+    detail = guardian.get(detail_url)
+    assert approved.status_code == shelf.status_code == detail.status_code == 200
+    parent_detail = detail.json()["data"]
+    for book in (approved.json()["data"], shelf.json()["data"]["items"][0], parent_detail):
+        assert book["storyVersionId"] == 302
+        assert book["sourceStoryVersionId"] == 301
+        assert book["continuation"] == {
+            "sourceReadingSessionId": source_id,
+            "sourceStoryVersionId": 301,
+            "sourceRevision": 1,
+            "sourcePageNumber": 1,
+            "sourceVisitedPageNumbers": [1],
+            "resumePageNumber": 2,
+        }
+
+    session = guardian.post(sessions_url, headers=headers, json={**session_body, "storyVersionId": 302})
+    assert session.status_code == 201
+    session_id = session.json()["data"]["readingSessionId"]
+    grant = guardian.put(f"{sessions_url}/{session_id}/mode-settings", headers=headers, json={
+        "mode": "CHILD_SOLO", "allowedStoryVersionIds": [302], "timeLimitSeconds": 600,
+    })
+    assert grant.status_code == 200
+    assert grant.json()["data"]["allowedStoryVersionIds"] == [302]
+
+    child_shelf = guardian.get(shelf_url)
+    child_detail = guardian.get(detail_url)
+    assert child_shelf.status_code == child_detail.status_code == 200
+    [shelf_book] = child_shelf.json()["data"]["items"]
+    for book in (shelf_book, child_detail.json()["data"]):
+        assert book["storyVersionId"] == 302
+        assert "continuation" not in book
+        assert "sourceStoryVersionId" not in book
+        assert book["pages"] == parent_detail["pages"]
+        assert [page["text"] for page in book["pages"][:2]] == ["v1第1页", "v2第2页"]
+        assert book["branches"] == parent_detail["branches"]
+        assert [branch["reviewStatus"] for branch in book["branches"]] == ["APPROVED", "APPROVED"]
+
+
+@pytest.mark.parametrize("continuation", [
+    pytest.param({"sourceReadingSessionId": None}, id="one-null"),
+    pytest.param({"sourceReadingSessionId": None, "expectedRevision": None, "clientRequestId": None}, id="all-null"),
+    pytest.param({"sourceReadingSessionId": 1, "expectedRevision": None, "clientRequestId": "switch"}, id="mixed"),
+])
+def test_create_reading_session_rejects_explicit_null_continuation_fields(cont_env, continuation):
+    guardian, _, db_path, profile_id = cont_env
+    headers = {"X-CSRF-Token": guardian.cookies["zhiya_csrf"]}
+    with closing(sqlite3.connect(db_path)) as db:
+        before = db.execute("SELECT COUNT(*) FROM reading_sessions").fetchone()
+        response = guardian.post("/api/v1/reading-sessions", headers=headers, json={
+            "childProfileId": profile_id, "storyVersionId": 301, "mode": "PARENT_CHILD", **continuation,
+        })
+        assert response.status_code == 422
+        assert db.execute("SELECT COUNT(*) FROM reading_sessions").fetchone() == before
+
+
 def test_continuation_switch_tc_fr17_04_and_idempotency(cont_env):
     first, second, db_path, pid = cont_env
     h1 = {"X-CSRF-Token": first.cookies["zhiya_csrf"]}

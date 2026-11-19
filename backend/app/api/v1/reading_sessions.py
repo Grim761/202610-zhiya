@@ -48,8 +48,10 @@ class SessionCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_continuation_fields(self):
-        fields = (self.sourceReadingSessionId, self.expectedRevision, self.clientRequestId)
-        if any(value is not None for value in fields) and not all(value is not None for value in fields):
+        switch_fields = {"sourceReadingSessionId", "expectedRevision", "clientRequestId"}
+        if self.model_fields_set & switch_fields and (
+            self.sourceReadingSessionId is None or self.expectedRevision is None or self.clientRequestId is None
+        ):
             raise ValueError("续写切换须同时提供 sourceReadingSessionId、expectedRevision 和 clientRequestId")
         return self
 

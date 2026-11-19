@@ -42,7 +42,7 @@ def page_object(db: sqlite3.Connection, page_row, *, manifest: dict | None = Non
     }
 
 
-def version_object(db, row):
+def version_object(db, row, principal: Principal):
     pages = db.execute(
         "SELECT * FROM story_pages WHERE version_id = ? ORDER BY page_no", (row["id"],)
     ).fetchall()
@@ -63,7 +63,7 @@ def version_object(db, row):
                       "nextPageNumber": b["next_page_no"], "choiceLabel": b["choice_label"],
                       "reviewStatus": b["review_status"]} for b in branches],
     }
-    if row["source_session_id"] is not None:
+    if principal.role == "GUARDIAN" and row["source_session_id"] is not None:
         data["sourceStoryVersionId"] = row["source_version_id"]
         data["continuation"] = {
             "sourceReadingSessionId": row["source_session_id"],
@@ -135,7 +135,7 @@ def list_storybooks(request: Request, age_band: AgeBand | None = Query(default=N
                 (*params, page_size, offset),
             ).fetchall()
             ensure_media_dependencies()
-            items = [version_object(db, row) for row in rows]
+            items = [version_object(db, row, principal) for row in rows]
             return {"data": {"items": items, "page": page, "pageSize": page_size}, "requestId": request.state.request_id}
     except (sqlite3.Error, MediaDependencyError):
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
@@ -177,7 +177,7 @@ def get_story_version(request: Request, version_id: int = Path(ge=1, le=90071992
             row = readable_story_version(db, principal, version_id)
             if not row:
                 return error(request, 404, "RESOURCE_NOT_FOUND", "绘本不可用")
-            return {"data": version_object(db, row), "requestId": request.state.request_id}
+            return {"data": version_object(db, row, principal), "requestId": request.state.request_id}
     except (sqlite3.Error, MediaDependencyError):
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
 
@@ -229,6 +229,31 @@ def recommend_storybooks(payload: RecommendationRequest, request: Request):
             return {"data": {"items": items}, "requestId": request.state.request_id}
     except sqlite3.Error:
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
+
+
+def _source_path_matches(db, session, revision: int, prefix: list[int]) -> bool:
+    if revision > session["revision"]:
+        return False
+    if revision == session["revision"]:
+        return (session["status"] == "IN_PROGRESS" and session["current_page_no"] == prefix[-1]
+                and json.loads(session["visited_pages_json"]) == prefix)
+
+    # Branch choices and continuation starts save the effective path. Ordinary page turns save the new page.
+    pages = []
+    for event in db.execute(
+        """SELECT COALESCE(b.next_page_no, e.page_no) AS page_no,
+                  json_extract(e.response_json, '$.data.visitedPageNumbers') AS visited
+           FROM interaction_events e LEFT JOIN story_branches b ON b.id = e.branch_id
+           WHERE e.session_id = ? AND e.revision_after <= ?
+             AND e.event_type IN ('STARTED', 'PAGE_CHANGED', 'BRANCH_CHOSEN')
+           ORDER BY e.revision_after, e.id""",
+        (session["id"], revision),
+    ):
+        if event["visited"] is None:
+            pages.append(event["page_no"])
+        else:
+            pages = json.loads(event["visited"])
+    return pages == prefix
 
 
 def _verify_version_for_approval(db, version_row, owner: int) -> str | None:
@@ -311,7 +336,7 @@ def _verify_version_for_approval(db, version_row, owner: int) -> str | None:
                 or version_row["resume_page_no"] != len(prefix) + 1):
             return "续写前缀或继续页码不合法"
         src = db.execute(
-            """SELECT s.id FROM reading_sessions s
+            """SELECT s.id, s.status, s.revision, s.current_page_no, s.visited_pages_json FROM reading_sessions s
                JOIN child_profiles p ON p.id = s.profile_id
                JOIN story_versions sv ON sv.id = s.version_id
                WHERE s.id = ? AND p.guardian_id = ? AND s.version_id = ? AND sv.storybook_id = ?
@@ -321,7 +346,7 @@ def _verify_version_for_approval(db, version_row, owner: int) -> str | None:
         if not src:
             return "续写源会话与绘本不匹配或不可用"
         source_pages = {p["page_no"]: p for p in db.execute(
-            "SELECT page_no, body_text, image_ref FROM story_pages WHERE version_id = ?",
+            "SELECT page_no, body_text, image_ref, default_next_page_number FROM story_pages WHERE version_id = ?",
             (version_row["source_version_id"],),
         )}
         for carried_page, source_page in enumerate(prefix, start=1):
@@ -333,6 +358,17 @@ def _verify_version_for_approval(db, version_row, owner: int) -> str | None:
                 return "续写前文正文与源版本不一致"
             if page_map[carried_page]["image_ref"] != source_pages[source_page]["image_ref"]:
                 return "续写前文配图与源版本不一致"
+        source_branches = {
+            (branch["from_page_no"], branch["next_page_no"]) for branch in db.execute(
+                "SELECT from_page_no, next_page_no FROM story_branches WHERE version_id = ? AND review_status = 'APPROVED'",
+                (version_row["source_version_id"],),
+            )
+        }
+        for start, end in zip(prefix, prefix[1:]):
+            if source_pages[start]["default_next_page_number"] != end and (start, end) not in source_branches:
+                return "续写前文包含源版本中不可读的跳转"
+        if not _source_path_matches(db, src, version_row["source_revision"], prefix):
+            return "续写快照与源会话进度不一致"
         for pno in range(1, len(prefix)):
             if page_map[pno]["default_next_page_number"] != pno + 1:
                 return "续写前文阅读路径不连续"
@@ -392,7 +428,7 @@ def approve_story_version(payload: VersionApproval, request: Request,
                    JOIN storybooks b ON b.id = v.storybook_id WHERE v.id = ?""",
                 (version_id,),
             ).fetchone()
-            return {"data": version_object(db, updated), "requestId": request.state.request_id}
+            return {"data": version_object(db, updated, principal), "requestId": request.state.request_id}
     except MediaDependencyError:
         return error(request, 503, "DEPENDENCY_UNAVAILABLE", "服务暂不可用", retryable=True)
     except sqlite3.Error:

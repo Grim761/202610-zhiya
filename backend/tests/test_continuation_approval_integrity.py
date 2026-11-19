@@ -36,6 +36,7 @@ def _seed_draft(cont_env, *, source_branch=False, branching=0):
         db_path, 302, 2, created.json()["data"]["readingSessionId"], 2, source_page, [1, source_page],
         branching=branching,
     )
+    return session_url
 
 
 def _approve(client):
@@ -99,6 +100,132 @@ def test_approval_rejects_continuation_of_another_owned_book(cont_env):
     assert rejected.status_code == 422, rejected.text
     assert rejected.json()["error"]["code"] == "VALIDATION_ERROR"
     assert _version_states(db_path) == [(301, "APPROVED_PRIVATE"), (302, "PENDING_REVIEW"), (310, "APPROVED_PRIVATE")]
+
+
+def test_approval_requires_source_path_edges_even_after_session_advances(cont_env):
+    client, _, db_path, _ = cont_env
+    branch_sql = "INSERT INTO story_branches VALUES (801, 301, 1, 3, '走近路', ?)"
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE story_versions SET branching = 1 WHERE id = 301")
+        db.execute(branch_sql, ("APPROVED",))
+    session_url = _seed_draft(cont_env, source_branch=True)
+    advanced = client.post(f"{session_url}/events", headers={"X-CSRF-Token": client.cookies["zhiya_csrf"]}, json={
+        "eventType": "PAGE_CHANGED", "pageNumber": 4, "expectedRevision": 2, "clientEventId": "source-after-draft",
+    })
+    assert advanced.status_code == 201, advanced.text
+
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("DELETE FROM story_branches WHERE id = 801")
+        db.execute("UPDATE story_versions SET branching = 0 WHERE id = 301")
+    rejected = _approve(client)
+    assert rejected.status_code == 422, rejected.text
+    assert rejected.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert _version_states(db_path) == [(301, "APPROVED_PRIVATE"), (302, "PENDING_REVIEW")]
+
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE story_versions SET branching = 1 WHERE id = 301")
+        db.execute(branch_sql, ("PENDING",))
+    rejected = _approve(client)
+    assert rejected.status_code == 422, rejected.text
+    assert rejected.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert _version_states(db_path) == [(301, "APPROVED_PRIVATE"), (302, "PENDING_REVIEW")]
+
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE story_branches SET review_status = 'APPROVED' WHERE id = 801")
+    approved = _approve(client)
+    assert approved.status_code == 200, approved.text
+    assert _version_states(db_path) == [(301, "RETIRED"), (302, "APPROVED_PRIVATE")]
+
+
+@pytest.mark.parametrize(("source_revision", "source_page"), [(2, 3), (3, 2)], ids=["different-path", "future-revision"])
+def test_approval_rejects_snapshot_inconsistent_with_live_session(cont_env, source_revision, source_page):
+    client, _, db_path, _ = cont_env
+    _seed_draft(cont_env)
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE story_versions SET branching = 1 WHERE id = 301")
+        db.execute("INSERT INTO story_branches VALUES (801, 301, 1, 3, '走近路', 'APPROVED')")
+        db.execute(
+            "UPDATE story_versions SET source_revision = ?, source_page_no = ?, source_visited_pages_json = ? WHERE id = 302",
+            (source_revision, source_page, f"[1,{source_page}]"),
+        )
+        db.execute(
+            """UPDATE story_pages SET body_text = (
+                SELECT body_text FROM story_pages WHERE version_id = 301 AND page_no = ?
+            ) WHERE version_id = 302 AND page_no = 2""",
+            (source_page,),
+        )
+
+    rejected = _approve(client)
+    assert rejected.status_code == 422, rejected.text
+    assert rejected.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert _version_states(db_path) == [(301, "APPROVED_PRIVATE"), (302, "PENDING_REVIEW")]
+
+
+def test_approval_requires_path_actually_read_at_older_revision(cont_env):
+    client, _, db_path, _ = cont_env
+    session_url = _seed_draft(cont_env)
+    advanced = client.post(f"{session_url}/events", headers={"X-CSRF-Token": client.cookies["zhiya_csrf"]}, json={
+        "eventType": "PAGE_CHANGED", "pageNumber": 3, "expectedRevision": 2, "clientEventId": "source-after-draft",
+    })
+    assert advanced.status_code == 201, advanced.text
+
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE story_versions SET branching = 1 WHERE id = 301")
+        db.execute("INSERT INTO story_branches VALUES (801, 301, 1, 3, '走近路', 'APPROVED')")
+        db.execute("""UPDATE story_versions SET source_page_no = 3, source_visited_pages_json = '[1,3]'
+            WHERE id = 302""")
+        db.execute("UPDATE story_pages SET body_text = 'v1第3页' WHERE version_id = 302 AND page_no = 2")
+
+    rejected = _approve(client)
+    assert rejected.status_code == 422, rejected.text
+    assert rejected.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert _version_states(db_path) == [(301, "APPROVED_PRIVATE"), (302, "PENDING_REVIEW")]
+
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("""UPDATE story_versions SET source_page_no = 2, source_visited_pages_json = '[1,2]'
+            WHERE id = 302""")
+        db.execute("UPDATE story_pages SET body_text = 'v1第2页' WHERE version_id = 302 AND page_no = 2")
+
+    approved = _approve(client)
+    assert approved.status_code == 200, approved.text
+    assert _version_states(db_path) == [(301, "RETIRED"), (302, "APPROVED_PRIVATE")]
+
+
+@pytest.mark.parametrize(("revision", "prefix"), [(1, [1, 2, 3]), (2, [1, 2, 3, 4])], ids=["started", "branch-chosen"])
+def test_approval_recovers_older_successor_snapshot(cont_env, revision, prefix):
+    client, _, db_path, profile_id = cont_env
+    source_url = _seed_draft(cont_env, branching=1)
+    approved = _approve(client)
+    assert approved.status_code == 200, approved.text
+
+    sessions_url = "/api/v1/reading-sessions"
+    headers = {"X-CSRF-Token": client.cookies["zhiya_csrf"]}
+    switched = client.post(sessions_url, headers=headers, json={
+        "childProfileId": profile_id, "storyVersionId": 302, "mode": "PARENT_CHILD",
+        "sourceReadingSessionId": int(source_url.rsplit("/", 1)[1]),
+        "expectedRevision": 2, "clientRequestId": "switch-to-second-version",
+    })
+    assert switched.status_code == 201, switched.text
+    successor = switched.json()["data"]
+    assert successor["visitedPageNumbers"] == [1, 2, 3]
+    session_id = successor["readingSessionId"]
+    session_url = f"{sessions_url}/{session_id}"
+
+    chosen = client.post(f"{session_url}/branches", headers=headers, json={
+        "branchId": 901, "expectedRevision": 1, "clientEventId": "source-branch",
+    })
+    assert chosen.status_code == 201, chosen.text
+    advanced = client.post(f"{session_url}/events", headers=headers, json={
+        "eventType": "PAGE_CHANGED", "pageNumber": 5, "expectedRevision": 2, "clientEventId": "source-page-five",
+    })
+    assert advanced.status_code == 201, advanced.text
+
+    _seed_continuation_draft(db_path, 303, 3, session_id, revision, prefix[-1], prefix, src_version_id=302)
+    approved = client.post("/api/v1/story-versions/303/approvals", headers=headers, json={
+        "versionNumber": 3, "reviewedAllBranches": True,
+    })
+    assert approved.status_code == 200, approved.text
+    assert _version_states(db_path) == [(301, "RETIRED"), (302, "RETIRED"), (303, "APPROVED_PRIVATE")]
 
 
 def test_approval_rejects_distinct_branch_labels_with_same_destination(cont_env):
