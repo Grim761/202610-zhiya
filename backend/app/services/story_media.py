@@ -510,9 +510,9 @@ def _template_catalog() -> list[dict]:
         assets: list[tuple[str, str]] = []
         for item in ordered:
             ref = item.get("image_ref")
-            note = (item.get("image_license_note") or "").strip()
-            if _image_path_parts(ref) is not None and note == TEMPLATE_PAGE_LICENSE:
-                assets.append((str(ref), note))
+            note = item.get("image_license_note")
+            if isinstance(note, str) and note.strip() == TEMPLATE_PAGE_LICENSE and _image_path_parts(ref) is not None:
+                assets.append((str(ref), TEMPLATE_PAGE_LICENSE))
         if len(assets) >= 4:
             catalog.append({
                 "version_id": vid,
@@ -529,7 +529,11 @@ def _template_catalog() -> list[dict]:
 def select_template_illustrations(age_band: str, topic: str, page_count: int) -> list[tuple[str, str]]:
     """Select an ordered set of licensed template illustrations matching age band and topic."""
     low, high = AGE_BAND_BOUNDS.get(age_band, (3, 6))
-    candidates = [entry for entry in _template_catalog() if len(entry["assets"]) >= page_count]
+    try:
+        catalog = _template_catalog()
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise MediaDependencyError("Template illustration catalog is invalid") from exc
+    candidates = [entry for entry in catalog if len(entry["assets"]) >= page_count]
     if not candidates:
         raise MediaDependencyError("No template illustration set matches the requested page count")
     best = max(

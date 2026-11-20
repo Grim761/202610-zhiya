@@ -312,14 +312,6 @@ def finish_generation(request, payload, digest, reserved, result, execution_stat
                     source_session_id=source["id"] if source is not None else None,
                 )
             return error(request, 504, "REQUEST_OUTCOME_UNKNOWN", "生成结果未知")
-        if execution["deadline_at"] <= now:
-            unknown = error(request, 504, "REQUEST_OUTCOME_UNKNOWN", "生成结果未知")
-            db.execute(
-                """UPDATE request_executions SET status = 'UNKNOWN', completed_at = ?, response_status = 504,
-                   response_body = ? WHERE id = ? AND status = 'RUNNING'""",
-                (now, unknown.body.decode(), execution["id"]),
-            )
-            return unknown
         if source is not None:
             current = source_session(db, owner, source["id"])
             if current is None:
@@ -330,7 +322,8 @@ def finish_generation(request, payload, digest, reserved, result, execution_stat
             ):
                 result = error(request, 409, "CONTINUATION_STALE", "源会话进度已更新")
                 execution_status = "FAILED"
-        if execution_status == "SUCCEEDED":
+        saving_draft = execution_status == "SUCCEEDED" and now < execution["deadline_at"]
+        if saving_draft:
             db.execute("SAVEPOINT draft")
             try:
                 result = save_draft(db, request, payload, owner, source, carried_pages, total, decision, result, now)
@@ -339,12 +332,18 @@ def finish_generation(request, payload, digest, reserved, result, execution_stat
                     raise
                 result = error(request, 503, "DEPENDENCY_UNAVAILABLE", "绘本媒体暂不可用")
             if result.status_code != 201:
-                db.execute("ROLLBACK TO draft")
                 execution_status = "FAILED"
+        completed_at = max(now, int(time.time() * 1000))
+        if completed_at >= execution["deadline_at"]:
+            result = error(request, 504, "REQUEST_OUTCOME_UNKNOWN", "生成结果未知")
+            execution_status = "UNKNOWN"
+        if saving_draft:
+            if execution_status != "SUCCEEDED":
+                db.execute("ROLLBACK TO draft")
             db.execute("RELEASE draft")
         db.execute(
             """UPDATE request_executions SET status = ?, completed_at = ?, response_status = ?, response_body = ?
-               WHERE id = ?""", (execution_status, now, result.status_code, result.body.decode(), execution["id"]),
+               WHERE id = ?""", (execution_status, completed_at, result.status_code, result.body.decode(), execution["id"]),
         )
         return result
 

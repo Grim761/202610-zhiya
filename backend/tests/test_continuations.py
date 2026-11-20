@@ -428,6 +428,51 @@ def test_story_generation_execution_lifecycle_fenced_json_and_race_guards(cont_e
         assert db.execute("SELECT COUNT(*) FROM request_executions WHERE scope_type = 'STORY_GENERATION'").fetchone()[0] == 0
 
 
+def test_draft_reaching_deadline_during_save_is_rolled_back(cont_env, monkeypatch):
+    from types import SimpleNamespace
+    from app.api.v1 import story_generations
+
+    client, _, db_path, _ = cont_env
+    headers = {"X-CSRF-Token": client.cookies["zhiya_csrf"]}
+    payload = {"ageBand": "AGE_4_5", "topic": "互助", "characters": ["小兔"], "scene": "森林",
+               "branching": False, "clientRequestId": "slow-draft"}
+    calls = 0
+    now = 1000
+
+    class StoryModel:
+        async def generate(self, request):
+            nonlocal calls
+            calls += 1
+            return ModelGenerateResult(success=True, text=json.dumps({
+                "title": "森林散步", "pages": ["小兔出发了。", "小兔走进森林。", "朋友来帮忙。", "大家回家了。"],
+            }))
+
+    save_draft = story_generations.save_draft
+
+    def slow_save(*args):
+        nonlocal now
+        response = save_draft(*args)
+        assert response.status_code == 201
+        now += 65
+        return response
+
+    monkeypatch.setattr(client.app.state, "model_adapter", StoryModel())
+    monkeypatch.setattr(story_generations, "time", SimpleNamespace(time=lambda: now))
+    monkeypatch.setattr(story_generations, "save_draft", slow_save)
+    for _ in range(2):
+        response = client.post("/api/v1/story-generations", headers=headers, json=payload)
+        assert response.status_code == 504
+        assert response.json()["error"]["code"] == "REQUEST_OUTCOME_UNKNOWN"
+    assert calls == 1
+    with closing(sqlite3.connect(db_path)) as db:
+        assert db.execute("SELECT COUNT(*) FROM storybooks").fetchone() == (1,)
+        assert db.execute("SELECT COUNT(*) FROM story_versions").fetchone() == (1,)
+        assert db.execute("SELECT COUNT(*) FROM story_pages").fetchone() == (4,)
+        assert db.execute(
+            "SELECT status, completed_at = deadline_at FROM request_executions WHERE client_request_id = 'slow-draft'"
+        ).fetchone() == ("UNKNOWN", 1)
+
+
 def test_story_generation_gateway_60s_budget_and_template_illustrations_4_pages(cont_env, monkeypatch):
     import asyncio
     import httpx
@@ -520,15 +565,19 @@ def test_story_generation_gateway_60s_budget_and_template_illustrations_4_pages(
         client.portal.call(gateway.__aexit__)
 
 
-def test_original_generation_requires_recognized_template_license_before_model_call(cont_env, monkeypatch, tmp_path):
+@pytest.mark.parametrize("catalog_error", ["unlicensed", "invalid_version_id"])
+def test_original_generation_rejects_invalid_catalog_before_model_call(cont_env, monkeypatch, tmp_path, catalog_error):
     from unittest.mock import AsyncMock
     from app.services import story_media
 
     client, _, db_path, _ = cont_env
     source_pages = json.loads(story_media.DEFAULT_TEMPLATE_PAGES.read_text(encoding="utf-8"))
-    for page in source_pages:
-        if page.get("image_license_note") == "NO-COMMERCIAL":
-            page["image_license_note"] = "禁止使用"
+    if catalog_error == "invalid_version_id":
+        source_pages[0]["version_id"] = "invalid"
+    else:
+        for page in source_pages:
+            if page.get("image_license_note") == "NO-COMMERCIAL":
+                page["image_license_note"] = "禁止使用"
     catalog = tmp_path / "template-pages.json"
     catalog.write_text(json.dumps(source_pages), encoding="utf-8")
     monkeypatch.setattr(story_media, "DEFAULT_TEMPLATE_PAGES", catalog)
@@ -539,6 +588,7 @@ def test_original_generation_requires_recognized_template_license_before_model_c
                            json={"ageBand": "AGE_3_4", "topic": "互助", "characters": ["小兔"], "scene": "森林",
                                  "branching": False, "clientRequestId": "restricted-template"})
     assert response.status_code == 503 and response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+    assert response.json()["error"]["retryable"] is True
     model.generate.assert_not_awaited()
     with closing(sqlite3.connect(db_path)) as db:
         assert not db.execute("SELECT 1 FROM request_executions WHERE client_request_id = 'restricted-template'").fetchone()
